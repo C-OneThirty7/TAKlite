@@ -1,0 +1,11 @@
+.git
+taklite/data
+taklite/packages
+taklite/certs
+*.zip
+*.tar
+*.tar.gz
+__pycache__
+*.pyc
+frontend/node_modules
+frontend/dist

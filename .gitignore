@@ -1,0 +1,41 @@
+# Runtime/generated configuration
+.env
+.env.*
+!.env.example
+!.env.desktop.example
+
+# TAKlite runtime data
+taklite/data/
+taklite/packages/
+taklite/certs/
+taklite/**/*.sqlite3
+taklite/**/*.db
+*.dp.zip
+*.p12
+*.key
+*.csr
+*.crt
+*.srl
+
+# WireGuard/admin recovery material
+taklite-admin/
+*.conf
+
+# Python/build/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+frontend/node_modules/
+frontend/dist/
+
+# Archives and local release artifacts
+*.zip
+*.tar
+*.tar.gz
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
