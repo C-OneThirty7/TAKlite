@@ -39,6 +39,18 @@ prompt_default() {
   printf '%s' "${value:-$default}"
 }
 
+prompt_yes_no() {
+  local prompt="$1"
+  local default="$2"
+  local value normalized
+  read -r -p "${prompt} [${default}]: " value
+  normalized="${value:-$default}"
+  case "${normalized,,}" in
+    y|yes|true|1) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 random_token() {
   python3 -c 'import secrets, string; alphabet=string.ascii_letters+string.digits+"._=-"; print("".join(secrets.choice(alphabet) for _ in range(32)))'
 }
@@ -151,6 +163,31 @@ detect_public_interface() {
   ip -4 route ls default | awk '/dev/ {for (i=1; i<=NF; i++) if ($i=="dev") print $(i+1)}' | head -n1
 }
 
+detect_lan_ipv4() {
+  local default_nic="${1:-}"
+  if [[ -n "${default_nic}" ]]; then
+    ip -4 -o addr show dev "${default_nic}" scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+    return
+  fi
+  ip -4 -o addr show scope global | awk '
+    $2 !~ /^(lo|docker|docker0|br-|veth|wg)/ {
+      split($4,a,"/");
+      print a[1];
+      exit
+    }
+  '
+}
+
+print_network_inventory() {
+  log "Detected IPv4 interfaces"
+  ip -4 -o addr show scope global | awk '{printf "  %-16s %s\n", $2, $4}' || true
+  local default_route
+  default_route="$(ip -4 route ls default 2>/dev/null | head -n1 || true)"
+  if [[ -n "${default_route}" ]]; then
+    log "Default IPv4 route: ${default_route}"
+  fi
+}
+
 ipv4_prefix24() {
   awk -F. '{print $1"."$2"."$3}' <<<"$1"
 }
@@ -202,14 +239,84 @@ install_packages() {
 }
 
 collect_settings() {
-  local detected_endpoint detected_nic base token_default
+  local detected_endpoint detected_nic detected_lan_ip base profile default_endpoint
+  local default_wgd_bind_ip default_taklite_bind_ip default_taklite_public_host
+  local default_lan_cidr enable_lan_admin
   detected_endpoint="$(detect_public_endpoint)"
   detected_nic="$(detect_public_interface)"
+  detected_lan_ip="$(detect_lan_ipv4 "${detected_nic}")"
 
   [[ -n "${detected_endpoint}" ]] || detected_endpoint="YOUR_VPS_PUBLIC_IP"
   [[ -n "${detected_nic}" ]] || detected_nic="eth0"
+  [[ -n "${detected_lan_ip}" ]] || detected_lan_ip="192.168.0.10"
 
-  SERVER_ENDPOINT="$(prompt_default "Public IP or DNS name clients use for WireGuard" "${detected_endpoint}")"
+  print_network_inventory
+
+  cat <<'EOF'
+
+Deployment profiles:
+  cloud  - public VPS/cloud server; WireGuard is exposed directly on the server public IP.
+  nat    - server is behind a router/firewall/NAT; forward WireGuard UDP to this host.
+  local  - LAN/lab testing only; clients use this host's LAN IP as the WireGuard endpoint.
+  custom - choose every bind/endpoint value manually.
+
+EOF
+
+  profile="$(prompt_default "Deployment profile" "cloud")"
+  profile="${profile,,}"
+  case "${profile}" in
+    cloud|vps)
+      profile="cloud"
+      default_endpoint="${detected_endpoint}"
+      default_wgd_bind_ip="10.66.66.1"
+      default_taklite_bind_ip="10.66.66.1"
+      default_taklite_public_host="10.66.66.1"
+      enable_lan_admin="no"
+      ;;
+    nat|router|proxmox)
+      profile="nat"
+      default_endpoint="${detected_endpoint}"
+      default_wgd_bind_ip="${detected_lan_ip}"
+      default_taklite_bind_ip="10.66.66.1"
+      default_taklite_public_host="10.66.66.1"
+      enable_lan_admin="yes"
+      ;;
+    local|lan|lab)
+      profile="local"
+      default_endpoint="${detected_lan_ip}"
+      default_wgd_bind_ip="${detected_lan_ip}"
+      default_taklite_bind_ip="10.66.66.1"
+      default_taklite_public_host="10.66.66.1"
+      enable_lan_admin="yes"
+      ;;
+    custom)
+      default_endpoint="${detected_endpoint}"
+      default_wgd_bind_ip="10.66.66.1"
+      default_taklite_bind_ip="10.66.66.1"
+      default_taklite_public_host="10.66.66.1"
+      enable_lan_admin="no"
+      ;;
+    *)
+      log "Unknown profile '${profile}', using custom prompts"
+      profile="custom"
+      default_endpoint="${detected_endpoint}"
+      default_wgd_bind_ip="10.66.66.1"
+      default_taklite_bind_ip="10.66.66.1"
+      default_taklite_public_host="10.66.66.1"
+      enable_lan_admin="no"
+      ;;
+  esac
+
+  default_lan_cidr="$(ipv4_prefix24 "${detected_lan_ip}").0/24"
+
+  log "Profile selected: ${profile}"
+  if [[ "${profile}" == "nat" ]]; then
+    log "NAT profile expects your router/firewall to forward WireGuard UDP to this host. TAKlite does not configure the upstream router."
+  elif [[ "${profile}" == "local" ]]; then
+    log "Local profile is for LAN/lab testing and does not require a public WireGuard endpoint."
+  fi
+
+  SERVER_ENDPOINT="$(prompt_default "Public IP or DNS name clients use for WireGuard" "${default_endpoint}")"
   SERVER_NIC="$(prompt_default "Public network interface" "${detected_nic}")"
   WG_NIC="$(prompt_default "WireGuard interface name" "wg0")"
   WG_SERVER_IP="$(prompt_default "WireGuard server IPv4" "10.66.66.1")"
@@ -221,12 +328,17 @@ collect_settings() {
   ADMIN_IP="$(prompt_default "Initial admin WireGuard IPv4" "${base}.2")"
   ADMIN_ALLOWED_IPS="$(prompt_default "AllowedIPs for admin client" "0.0.0.0/0")"
   CLIENT_DNS="$(prompt_default "DNS resolver for generated peers" "1.1.1.1")"
-  WGD_BIND_IP="$(prompt_default "WGDashboard bind IP" "${WG_SERVER_IP}")"
+  WGD_BIND_IP="$(prompt_default "WGDashboard bind IP" "${default_wgd_bind_ip}")"
   WGD_PORT="$(prompt_default "WGDashboard port" "10086")"
   WGD_USER="$(prompt_default "WGDashboard username" "admin")"
   WGD_PASSWORD="$(random_token)"
-  TAKLITE_BIND_IP="$(prompt_default "TAKlite bind IP" "${WG_SERVER_IP}")"
-  TAKLITE_PUBLIC_HOST="$(prompt_default "TAKlite API host used in package URLs" "${TAKLITE_BIND_IP}")"
+  TAKLITE_BIND_IP="$(prompt_default "TAKlite bind IP" "${default_taklite_bind_ip}")"
+  TAKLITE_PUBLIC_HOST="$(prompt_default "TAKlite API host used in package URLs" "${default_taklite_public_host}")"
+  LAN_ACCESS_CIDR="$(prompt_default "LAN CIDR allowed to reach local dashboard/admin bindings" "${default_lan_cidr}")"
+  TAKLITE_ADMIN_LAN_BIND_IP=""
+  if prompt_yes_no "Expose TAKlite admin UI on LAN IP as well" "${enable_lan_admin}"; then
+    TAKLITE_ADMIN_LAN_BIND_IP="$(prompt_default "TAKlite admin LAN bind IP" "${detected_lan_ip}")"
+  fi
   TAKLITE_ADMIN_TOKEN="$(prompt_default "TAKlite admin token" "$(random_token)")"
   TAKLITE_CERT_PASSWORD="$(prompt_default "ATAK/WinTAK certificate password" "atakatak")"
   TAKLITE_SECURE_MODE="$(prompt_default "Enable secure mode: require TLS cert identity and enforce groups" "yes")"
@@ -247,6 +359,7 @@ collect_settings() {
 
 write_wireguard_config() {
   local server_priv server_pub admin_priv admin_pub admin_psk wg_network
+  local lan_postup="" lan_postdown=""
 
   [[ ! -e "${WG_DIR}/${WG_NIC}.conf" ]] || die "${WG_DIR}/${WG_NIC}.conf already exists; refusing to overwrite"
 
@@ -259,6 +372,15 @@ write_wireguard_config() {
   admin_pub="$(printf '%s' "${admin_priv}" | wg pubkey)"
   admin_psk="$(wg genpsk)"
   wg_network="$(ipv4_prefix24 "${WG_SERVER_IP}").0/${WG_CIDR}"
+
+  if [[ -n "${LAN_ACCESS_CIDR:-}" && "${WGD_BIND_IP}" != "${WG_SERVER_IP}" ]]; then
+    lan_postup+="PostUp = iptables -C INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${WGD_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${WGD_PORT} -j ACCEPT"$'\n'
+    lan_postdown+="PostDown = iptables -D INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${WGD_PORT} -j ACCEPT 2>/dev/null || true"$'\n'
+  fi
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    lan_postup+="PostUp = iptables -C INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${TAKLITE_HTTP_HOST_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${TAKLITE_HTTP_HOST_PORT} -j ACCEPT"$'\n'
+    lan_postdown+="PostDown = iptables -D INPUT -s ${LAN_ACCESS_CIDR} -p tcp --dport ${TAKLITE_HTTP_HOST_PORT} -j ACCEPT 2>/dev/null || true"$'\n'
+  fi
 
   cat >"${WG_DIR}/${WG_NIC}.conf" <<EOF
 [Interface]
@@ -276,7 +398,7 @@ PostUp = iptables -C INPUT -i ${WG_NIC} -p tcp --dport ${TAKLITE_COT_TLS_HOST_PO
 PostUp = iptables -C FORWARD -i ${WG_NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD -i ${WG_NIC} -j ACCEPT
 PostUp = iptables -C FORWARD -o ${WG_NIC} -j ACCEPT 2>/dev/null || iptables -I FORWARD -o ${WG_NIC} -j ACCEPT
 PostUp = iptables -t nat -C POSTROUTING -s ${wg_network} -o ${SERVER_NIC} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s ${wg_network} -o ${SERVER_NIC} -j MASQUERADE
-PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
+${lan_postup}PostDown = iptables -D INPUT -p udp --dport ${WG_PORT} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D INPUT -i ${WG_NIC} -p tcp --dport 22 -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D INPUT -i ${WG_NIC} -p tcp --dport ${WGD_PORT} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D INPUT -i ${WG_NIC} -p tcp --dport ${TAKLITE_HTTP_HOST_PORT} -j ACCEPT 2>/dev/null || true
@@ -286,6 +408,7 @@ PostDown = iptables -D INPUT -i ${WG_NIC} -p tcp --dport ${TAKLITE_COT_TLS_HOST_
 PostDown = iptables -D FORWARD -i ${WG_NIC} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -D FORWARD -o ${WG_NIC} -j ACCEPT 2>/dev/null || true
 PostDown = iptables -t nat -D POSTROUTING -s ${wg_network} -o ${SERVER_NIC} -j MASQUERADE 2>/dev/null || true
+${lan_postdown}
 
 ### Client ${ADMIN_NAME}
 [Peer]
@@ -1023,8 +1146,21 @@ TAKLITE_WG_INTERFACE=${WG_NIC}
 TAKLITE_PUBLIC_INTERFACE=${SERVER_NIC}
 TAKLITE_WIREGUARD_PORT=${WG_PORT}
 TAKLITE_WGDASHBOARD_PORT=${WGD_PORT}
+TAKLITE_LAN_ACCESS_CIDR=${LAN_ACCESS_CIDR}
+TAKLITE_ADMIN_LAN_BIND_IP=${TAKLITE_ADMIN_LAN_BIND_IP}
 EOF
   chmod 600 "${BASE_DIR}/.env"
+
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    log "Writing TAKlite LAN admin bind override for ${TAKLITE_ADMIN_LAN_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}"
+    cat >"${BASE_DIR}/docker-compose.override.yml" <<EOF
+services:
+  taklite:
+    ports:
+      - "${TAKLITE_ADMIN_LAN_BIND_IP}:\${TAKLITE_HTTP_HOST_PORT:-8080}:8080/tcp"
+EOF
+    chmod 600 "${BASE_DIR}/docker-compose.override.yml"
+  fi
 
   log "Building and starting TAKlite"
   (
@@ -1034,6 +1170,11 @@ EOF
 }
 
 write_admin_notes() {
+  local taklite_lan_note=""
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    taklite_lan_note="  TAKlite LAN UI: http://${TAKLITE_ADMIN_LAN_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/"
+  fi
+
   cat >"${ADMIN_OUT_DIR}/bootstrap-token.txt" <<EOF
 TAKlite bootstrap token:
 ${TAKLITE_ADMIN_TOKEN}
@@ -1059,6 +1200,7 @@ From the admin computer:
 After importing and connecting WireGuard:
   WGDashboard: http://${WGD_BIND_IP}:${WGD_PORT}
   TAKlite UI:  http://${TAKLITE_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/
+${taklite_lan_note}
   TAKlite HTTPS API: https://${TAKLITE_BIND_IP}:${TAKLITE_HTTPS_HOST_PORT}/Marti
 
 WGDashboard login:
@@ -1114,6 +1256,13 @@ EOF
 }
 
 print_summary() {
+  local taklite_lan_note=""
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    taklite_lan_note="
+TAKlite LAN URL, if using a local admin browser:
+   http://${TAKLITE_ADMIN_LAN_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/"
+  fi
+
   cat <<EOF
 
 TAKlite VPS install complete.
@@ -1128,6 +1277,7 @@ Admin WireGuard QR:
 
 TAKlite URL after VPN connection:
    http://${TAKLITE_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/
+${taklite_lan_note}
 
 TAKlite one-time bootstrap token:
    ${TAKLITE_ADMIN_TOKEN}

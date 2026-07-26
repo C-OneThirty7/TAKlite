@@ -64,6 +64,13 @@ chmod +x install.sh smoke-test.sh
 
 The installer prompts for environment-specific values and prints the admin WireGuard profile, WGDashboard login, TAKlite bootstrap token, and certificate password at completion. The ATAK/WinTAK certificate password defaults to `atakatak` unless you change it during install.
 
+Installer deployment profiles:
+
+- `cloud`: public VPS/cloud server with WireGuard exposed directly on the server public IP
+- `nat`: server is behind a router/firewall/NAT, such as Proxmox at home or in a lab
+- `local`: LAN-only testing where clients use the server LAN IP as the WireGuard endpoint
+- `custom`: manually choose every endpoint and bind address
+
 Root-only recovery notes are saved on the VPS:
 
 ```text
@@ -244,6 +251,8 @@ Optional admin 2FA can be enabled from Settings after the first admin account is
 - [User Guide](docs/user-guide.md)
 - [User Guide PDF](docs/TAKlite-User-Guide.pdf)
 - [Admin Install Guide](docs/admin-install-guide.md)
+- [Proxmox / ISP Router Deployment Profile](docs/proxmox-isp-router-profile.md)
+- [Proxmox / ISP Router Deployment Profile PDF](docs/TAKlite-Proxmox-ISP-Router-Profile.pdf)
 - [Access Control Guide](docs/access-control-guide.md)
 - [Access Control Guide PDF](docs/TAKlite-Access-Control-Guide.pdf)
 - [Deployment And Update Lifecycle](docs/deployment-lifecycle.md)

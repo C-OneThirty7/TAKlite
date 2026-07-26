@@ -53,6 +53,12 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("docker_packages=(docker.io)", installer)
         self.assertIn('if docker compose version >/dev/null 2>&1; then', installer)
         self.assertIn('log "Existing Docker Compose v2 detected; reusing it"', installer)
+        self.assertIn('Deployment profiles:', installer)
+        self.assertIn('profile="$(prompt_default "Deployment profile" "cloud")"', installer)
+        self.assertIn('nat|router|proxmox)', installer)
+        self.assertIn('local|lan|lab)', installer)
+        self.assertIn('TAKLITE_ADMIN_LAN_BIND_IP=', installer)
+        self.assertIn('docker-compose.override.yml', installer)
 
         updater = (ROOT / "update.sh").read_text()
         append_start = updater.index("append_env_default() {")
