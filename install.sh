@@ -192,6 +192,156 @@ ipv4_prefix24() {
   awk -F. '{print $1"."$2"."$3}' <<<"$1"
 }
 
+is_valid_ipv4() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import ipaddress
+import sys
+ipaddress.ip_address(sys.argv[1])
+PY
+}
+
+is_valid_cidr() {
+  python3 - "$1" <<'PY' >/dev/null 2>&1
+import ipaddress
+import sys
+ipaddress.ip_network(sys.argv[1], strict=False)
+PY
+}
+
+is_valid_port() {
+  local value="$1"
+  [[ "${value}" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 65535 ))
+}
+
+is_valid_hostname() {
+  local value="$1"
+  [[ ${#value} -le 253 ]] || return 1
+  [[ "${value}" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]]
+}
+
+is_valid_endpoint() {
+  local value="$1"
+  [[ -n "${value}" ]] || return 1
+  [[ "${value}" != "YOUR_VPS_PUBLIC_IP" && "${value}" != "YOUR_PUBLIC_IP_OR_DNS" ]] || return 1
+  is_valid_ipv4 "${value}" || is_valid_hostname "${value}"
+}
+
+is_valid_interface_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_.:-]+$ ]]
+}
+
+require_existing_interface() {
+  local iface="$1"
+  is_valid_interface_name "${iface}" || die "invalid interface name: ${iface}"
+  ip link show dev "${iface}" >/dev/null 2>&1 || die "network interface does not exist: ${iface}"
+}
+
+validate_port_setting() {
+  local label="$1"
+  local value="$2"
+  is_valid_port "${value}" || die "${label} must be a TCP/UDP port from 1 to 65535"
+}
+
+validate_settings() {
+  log "Validating install settings"
+
+  is_valid_endpoint "${SERVER_ENDPOINT}" || die "WireGuard endpoint must be a public IP, LAN IP, or DNS name clients can reach"
+  require_existing_interface "${SERVER_NIC}"
+  is_valid_interface_name "${WG_NIC}" || die "invalid WireGuard interface name: ${WG_NIC}"
+  is_valid_ipv4 "${WG_SERVER_IP}" || die "WireGuard server IPv4 must be a valid IPv4 address"
+  [[ "${WG_CIDR}" =~ ^[0-9]+$ ]] && (( WG_CIDR >= 1 && WG_CIDR <= 32 )) || die "WireGuard IPv4 CIDR must be from 1 to 32"
+  is_valid_ipv4 "${ADMIN_IP}" || die "Initial admin WireGuard IPv4 must be a valid IPv4 address"
+  is_valid_ipv4 "${WGD_BIND_IP}" || die "WGDashboard bind IP must be a valid IPv4 address"
+  is_valid_ipv4 "${TAKLITE_BIND_IP}" || die "TAKlite bind IP must be a valid IPv4 address"
+  is_valid_endpoint "${TAKLITE_PUBLIC_HOST}" || die "TAKlite API host must be an IP or DNS name clients can reach"
+
+  if [[ -n "${LAN_ACCESS_CIDR:-}" ]]; then
+    is_valid_cidr "${LAN_ACCESS_CIDR}" || die "LAN access CIDR must be a valid CIDR, for example 192.168.0.0/24"
+  fi
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    is_valid_ipv4 "${TAKLITE_ADMIN_LAN_BIND_IP}" || die "TAKlite admin LAN bind IP must be a valid IPv4 address"
+    [[ -n "${LAN_ACCESS_CIDR:-}" ]] || die "LAN admin exposure requires a LAN access CIDR"
+  fi
+
+  validate_port_setting "WireGuard UDP port" "${WG_PORT}"
+  validate_port_setting "WGDashboard port" "${WGD_PORT}"
+  validate_port_setting "TAKlite plain CoT TCP host port" "${TAKLITE_COT_HOST_PORT}"
+  validate_port_setting "TAKlite TLS CoT TCP host port" "${TAKLITE_COT_TLS_HOST_PORT}"
+  validate_port_setting "TAKlite HTTP/admin host port" "${TAKLITE_HTTP_HOST_PORT}"
+  validate_port_setting "TAKlite HTTPS/Marti host port" "${TAKLITE_HTTPS_HOST_PORT}"
+
+  [[ -n "${TAKLITE_ADMIN_TOKEN}" ]] || die "TAKlite admin token cannot be empty"
+  [[ -n "${TAKLITE_CERT_PASSWORD}" ]] || die "ATAK/WinTAK certificate password cannot be empty"
+}
+
+print_exposure_summary() {
+  local upstream_note taklite_lan_line=""
+  case "${profile}" in
+    cloud)
+      upstream_note="Open ${WG_PORT}/udp to this server in the cloud firewall. Keep TAKlite, WGDashboard, CoT, and Marti ports closed publicly."
+      ;;
+    nat)
+      upstream_note="Forward only ${WG_PORT}/udp from the upstream router/firewall to this host. Do not forward TAKlite, WGDashboard, CoT, or Marti ports."
+      ;;
+    local)
+      upstream_note="LAN/lab profile. Clients use ${SERVER_ENDPOINT}:${WG_PORT}; no public router exposure is required unless you add it later."
+      ;;
+    *)
+      upstream_note="Custom profile. Confirm your router/firewall exposes only the services you intentionally choose."
+      ;;
+  esac
+
+  if [[ -n "${TAKLITE_ADMIN_LAN_BIND_IP:-}" ]]; then
+    taklite_lan_line="  TAKlite admin LAN:    http://${TAKLITE_ADMIN_LAN_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/ from ${LAN_ACCESS_CIDR}"
+  fi
+
+  cat <<EOF
+
+Install exposure plan
+=====================
+
+Profile:
+  ${profile}
+
+Upstream firewall/router:
+  ${upstream_note}
+
+Interfaces:
+  Public/LAN egress NIC: ${SERVER_NIC}
+  WireGuard interface:  ${WG_NIC}
+
+WireGuard:
+  Endpoint in generated peers: ${SERVER_ENDPOINT}:${WG_PORT}/udp
+  Server tunnel IP:            ${WG_SERVER_IP}/${WG_CIDR}
+  Initial admin peer:          ${ADMIN_NAME} at ${ADMIN_IP}/32
+  Admin client AllowedIPs:     ${ADMIN_ALLOWED_IPS}
+
+Admin dashboards:
+  WGDashboard:          http://${WGD_BIND_IP}:${WGD_PORT}
+  TAKlite admin VPN:    http://${TAKLITE_BIND_IP}:${TAKLITE_HTTP_HOST_PORT}/
+${taklite_lan_line}
+
+TAK services:
+  TAK HTTPS/Marti:      https://${TAKLITE_BIND_IP}:${TAKLITE_HTTPS_HOST_PORT}/Marti
+  TLS CoT:              ${TAKLITE_BIND_IP}:${TAKLITE_COT_TLS_HOST_PORT}
+  Plain CoT:            ${TAKLITE_BIND_IP}:${TAKLITE_COT_HOST_PORT}
+  Package URL host:     ${TAKLITE_PUBLIC_HOST}
+
+Security defaults:
+  Access enforcement:        ${TAKLITE_ACCESS_CONTROL_ENFORCE}
+  TLS client cert required:  ${TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT}
+  Legacy cert CN allowed:    ${TAKLITE_ALLOW_LEGACY_CLIENT_CERT}
+
+Do not publicly expose:
+  ${TAKLITE_HTTP_HOST_PORT}/tcp, ${TAKLITE_HTTPS_HOST_PORT}/tcp, ${TAKLITE_COT_TLS_HOST_PORT}/tcp, ${TAKLITE_COT_HOST_PORT}/tcp, ${WGD_PORT}/tcp
+
+EOF
+
+  if ! prompt_yes_no "Continue with this install plan" "yes"; then
+    die "install cancelled before writing WireGuard or TAKlite configuration"
+  fi
+}
+
 install_packages() {
   if command -v apt-get >/dev/null 2>&1; then
     log "Installing VPS packages with apt"
@@ -1332,6 +1482,8 @@ main() {
   preflight_host
   install_packages
   collect_settings
+  validate_settings
+  print_exposure_summary
   write_wireguard_config
   enable_wireguard
   install_wgdashboard

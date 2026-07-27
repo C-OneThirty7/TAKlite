@@ -90,6 +90,16 @@ chmod +x install.sh smoke-test.sh
 
 Use defaults unless your VPS environment requires different values. The installer checks OS family, version, CPU architecture, systemd, Docker Compose v2, and `/dev/net/tun` before making major changes.
 
+Before it writes WireGuard or TAKlite configuration, the installer validates your selected ports, IP addresses, CIDRs, and network interface. It then prints an install exposure plan and asks you to continue.
+
+Read the exposure plan before answering yes. Confirm:
+
+- WireGuard endpoint is the public IP, DNS name, or LAN IP your clients can reach.
+- Public/LAN egress NIC is the correct host interface.
+- WGDashboard is bound where you expect it.
+- TAKlite admin, Marti, CoT, and TLS CoT are on the VPN address unless you intentionally enabled LAN admin access.
+- The upstream router/firewall note matches the install type.
+
 Important defaults:
 
 ```text

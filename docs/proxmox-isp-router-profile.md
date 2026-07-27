@@ -78,6 +78,14 @@ The NAT profile uses these defaults:
 
 TAKlite does not configure the upstream router/firewall. The admin must forward the selected WireGuard UDP port to the Proxmox guest.
 
+Before any configuration is written, the installer prints an exposure plan. For this profile, that plan should show:
+
+- WireGuard endpoint as your public DNS/IP for remote clients, or the guest LAN IP for local-only testing.
+- WGDashboard on the Proxmox guest LAN IP.
+- TAKlite services on `10.66.66.1`.
+- Optional TAKlite admin LAN access only from the LAN CIDR.
+- A reminder that the upstream router should forward only the WireGuard UDP port.
+
 ## Install Values
 
 Use values like these when prompted.

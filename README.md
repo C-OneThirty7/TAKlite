@@ -71,6 +71,8 @@ Installer deployment profiles:
 - `local`: LAN-only testing where clients use the server LAN IP as the WireGuard endpoint
 - `custom`: manually choose every endpoint and bind address
 
+Before writing WireGuard or TAKlite configuration, the installer validates the selected ports, IPs, CIDRs, and host interface, then prints an exposure plan. Review it carefully and continue only when the WireGuard endpoint, dashboard bindings, TAKlite bindings, and upstream firewall notes match your environment.
+
 Root-only recovery notes are saved on the VPS:
 
 ```text
@@ -96,6 +98,16 @@ git clone https://github.com/C-OneThirty7/TAKlite.git
 cd TAKlite
 .\portable-start.ps1
 ```
+
+Windows Docker Desktop LAN install:
+
+Download and extract the Windows Docker Desktop release asset, then double-click:
+
+```text
+Install TAKlite.cmd
+```
+
+The Windows installer selects an existing Windows IPv4 address, binds TAKlite to it, starts Docker Desktop if needed, and creates scoped Windows Firewall rules for the TAKlite TCP ports. WireGuard is optional in this mode and must be handled separately.
 
 Docker Desktop GUI:
 
@@ -253,6 +265,8 @@ Optional admin 2FA can be enabled from Settings after the first admin account is
 - [Admin Install Guide](docs/admin-install-guide.md)
 - [Proxmox / ISP Router Deployment Profile](docs/proxmox-isp-router-profile.md)
 - [Proxmox / ISP Router Deployment Profile PDF](docs/TAKlite-Proxmox-ISP-Router-Profile.pdf)
+- [Windows Docker Desktop Guide](docs/windows-docker-desktop.md)
+- [Windows Docker Desktop Guide PDF](docs/TAKlite-Windows-Docker-Desktop-Guide.pdf)
 - [Access Control Guide](docs/access-control-guide.md)
 - [Access Control Guide PDF](docs/TAKlite-Access-Control-Guide.pdf)
 - [Deployment And Update Lifecycle](docs/deployment-lifecycle.md)

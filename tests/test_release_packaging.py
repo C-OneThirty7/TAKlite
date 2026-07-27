@@ -59,6 +59,11 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn('local|lan|lab)', installer)
         self.assertIn('TAKLITE_ADMIN_LAN_BIND_IP=', installer)
         self.assertIn('docker-compose.override.yml', installer)
+        self.assertIn('validate_settings() {', installer)
+        self.assertIn('print_exposure_summary() {', installer)
+        self.assertIn('Continue with this install plan', installer)
+        self.assertIn('WireGuard endpoint must be a public IP, LAN IP, or DNS name clients can reach', installer)
+        self.assertIn('network interface does not exist', installer)
 
         updater = (ROOT / "update.sh").read_text()
         append_start = updater.index("append_env_default() {")
@@ -84,6 +89,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("--release-zip", updater)
 
         service = (ROOT / "docker" / "taklite" / "taklite_service.py").read_text()
+        self.assertIn('VERSION = "TAKlite 0.2.22"', service)
         self.assertIn('TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT", "true"', service)
         self.assertIn('TAKLITE_ALLOW_LEGACY_CLIENT_CERT", "false"', service)
         self.assertIn('TAKLITE_ACCESS_CONTROL_ENFORCE", "true"', service)
@@ -123,13 +129,27 @@ class ReleasePackagingTests(unittest.TestCase):
         env_desktop = (ROOT / ".env.desktop.example").read_text()
         portable_sh = ROOT / "portable-start.sh"
         portable_ps1 = ROOT / "portable-start.ps1"
+        windows_cmd = ROOT / "Install TAKlite.cmd"
+        windows_installer = ROOT / "scripts" / "Install-TAKliteWindows.ps1"
+        windows_guide = ROOT / "docs" / "windows-docker-desktop.md"
+        windows_guide_pdf = ROOT / "docs" / "TAKlite-Windows-Docker-Desktop-Guide.pdf"
 
         self.assertTrue(portable_sh.exists())
         self.assertTrue(portable_ps1.exists())
+        self.assertTrue(windows_cmd.exists())
+        self.assertTrue(windows_installer.exists())
+        self.assertTrue(windows_guide.exists())
+        self.assertTrue(windows_guide_pdf.exists())
         self.assertIn("TAKLITE_AUTO_INIT_CERTS=true", env_desktop)
         self.assertIn("WG_BIND_IP=127.0.0.1", env_desktop)
         self.assertIn("portable mode does not install wireguard", portable_sh.read_text().lower())
         self.assertIn("Portable mode does not install WireGuard", portable_ps1.read_text())
+        self.assertIn("Install-TAKliteWindows.ps1", windows_cmd.read_text())
+        self.assertIn("Get-NetAdapter -Physical", windows_installer.read_text())
+        self.assertIn("New-NetFirewallRule", windows_installer.read_text())
+        self.assertIn("TAKLITE_PUBLIC_HOST=$BindIp", windows_installer.read_text())
+        self.assertIn("Rerun with -EnvMode Recreate", windows_installer.read_text())
+        self.assertIn("Running Next To Axon", windows_guide.read_text())
 
 
 if __name__ == "__main__":
