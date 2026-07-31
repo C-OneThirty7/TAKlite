@@ -86,6 +86,10 @@ stage_source() {
     --exclude '.git/' \
     --exclude '.env' \
     --exclude 'taklite/' \
+    --exclude 'plugins/' \
+    --exclude 'docs/plugin-controlled-delivery.md' \
+    --exclude 'docs/wintak-plugin-api.md' \
+    --exclude 'dist/' \
     --exclude 'frontend/node_modules/' \
     --exclude 'frontend/dist/' \
     --exclude '__pycache__/' \

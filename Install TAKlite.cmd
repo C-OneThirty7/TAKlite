@@ -17,6 +17,9 @@ if not "%TAKLITE_EXIT%"=="0" (
   echo It is safe to restart Windows, start Docker Desktop, and run Install TAKlite again.
 ) else (
   echo TAKlite installation completed successfully.
+  echo.
+  echo If you closed this window before saving the bootstrap token,
+  echo double-click "Show Bootstrap Token.cmd" in this same folder.
 )
 echo.
 pause

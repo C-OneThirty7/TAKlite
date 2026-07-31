@@ -84,12 +84,15 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("taklite-gui-update.path", updater)
         self.assertIn("taklite-settings.path", updater)
         self.assertIn("taklite-firewall.path", updater)
+        self.assertIn("--exclude 'plugins/'", updater)
+        self.assertIn("--exclude 'docs/plugin-controlled-delivery.md'", updater)
+        self.assertIn('"${APP_DIR}/uninstall.sh"', updater)
         self.assertIn("EXPECTED_SHA256", updater)
         self.assertIn("sha256sum -c -", updater)
         self.assertIn("--release-zip", updater)
 
         service = (ROOT / "docker" / "taklite" / "taklite_service.py").read_text()
-        self.assertIn('VERSION = "TAKlite 0.2.22"', service)
+        self.assertIn('VERSION = "TAKlite 0.2.23"', service)
         self.assertIn('TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT", "true"', service)
         self.assertIn('TAKLITE_ALLOW_LEGACY_CLIENT_CERT", "false"', service)
         self.assertIn('TAKLITE_ACCESS_CONTROL_ENFORCE", "true"', service)
@@ -97,6 +100,31 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn('TAKLITE_AUTO_INIT_CERTS", "false"', service)
         self.assertIn("verified_release_asset", service)
         self.assertIn("validate_sha256", service)
+
+    def test_uninstall_removes_host_side_security_and_runner_state(self):
+        uninstall = (ROOT / "uninstall.sh").read_text()
+
+        self.assertIn("/etc/fail2ban/jail.d/taklite-vps.local", uninstall)
+        self.assertIn("/etc/fail2ban/jail.d/taklite-auth.local", uninstall)
+        self.assertIn("/etc/fail2ban/filter.d/taklite-auth.conf", uninstall)
+        self.assertIn("taklite-gui-update.path", uninstall)
+        self.assertIn("taklite-settings.path", uninstall)
+        self.assertIn("taklite-firewall.path", uninstall)
+        self.assertIn("/usr/local/sbin/taklite-gui-update-runner", uninstall)
+
+    def test_release_packagers_exclude_local_plugin_prototypes(self):
+        packager = (ROOT / "scripts" / "package-windows-offline.sh").read_text()
+        reinstall = (ROOT / "reinstall.sh").read_text()
+        dockerignore = (ROOT / ".dockerignore").read_text()
+        readme = (ROOT / "README.md").read_text()
+
+        for text in (packager, reinstall, dockerignore):
+            self.assertIn("plugins", text)
+            self.assertIn("docs/plugin-controlled-delivery.md", text)
+            self.assertIn("docs/wintak-plugin-api.md", text)
+        self.assertNotIn("plugins/atak-taklite-control", readme)
+        self.assertNotIn("plugin-controlled-delivery.md", readme)
+        self.assertNotIn("wintak-plugin-api.md", readme)
 
     def test_gui_update_runner_requires_hash_verified_release_zip(self):
         installer = (ROOT / "install.sh").read_text()
@@ -150,6 +178,15 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("TAKLITE_PUBLIC_HOST=$BindIp", windows_installer.read_text())
         self.assertIn("Rerun with -EnvMode Recreate", windows_installer.read_text())
         self.assertIn("Running Next To Axon", windows_guide.read_text())
+        self.assertIn("Update TAKlite.cmd", windows_guide.read_text())
+        self.assertIn("update", windows_guide.read_text().lower())
+
+    def test_frontend_primary_user_workflow_does_not_show_redundant_packages_nav(self):
+        frontend = (ROOT / "frontend" / "src" / "main.jsx").read_text()
+
+        self.assertIn("Connection Users", frontend)
+        self.assertIn("/api/portal-users/create", frontend)
+        self.assertNotIn("id: 'packages'", frontend)
 
 
 if __name__ == "__main__":

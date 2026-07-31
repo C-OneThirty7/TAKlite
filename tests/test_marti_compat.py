@@ -94,6 +94,26 @@ class MartiCompatibilityTests(unittest.TestCase):
         packages = self.service.list_packages()
         self.assertEqual({item["Name"] for item in packages}, {"upload.dp.zip", "put.dp.zip"})
 
+    def test_admin_upload_path_stores_public_datapackage(self):
+        self.service.create_admin("admin", "password1234")
+        session = self.service.create_session("admin")
+        payload = datapackage_bytes("admin-upload")
+
+        status, _, body = self.request(
+            "POST",
+            "/api/datapackages/upload?filename=admin-maps.dp.zip",
+            payload,
+            {"Content-Type": "application/zip", "X-Session-Token": session},
+        )
+
+        self.assertEqual(status, 200, body.decode("utf-8", "replace"))
+        response = json.loads(body.decode("utf-8"))
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["package"]["Name"], "admin-maps.dp.zip")
+        self.assertEqual(response["package"]["Tool"], "public")
+        packages = self.service.list_packages()
+        self.assertEqual(packages[0]["CreatorUid"], "TAKlite-Admin")
+
     def test_missionupload_accepts_atak_plain_name_and_stores_zip_name(self):
         payload = datapackage_bytes("atak-maps")
         body, headers = multipart_upload("assetfile", "maps", payload)

@@ -15,6 +15,8 @@ $BundleRoot = Split-Path -Parent $PSScriptRoot
 $ComposeFile = Join-Path $BundleRoot "docker-compose.yml"
 $EnvironmentPath = Join-Path $BundleRoot ".env"
 $RuntimeRoot = Join-Path $BundleRoot "taklite"
+$OfflineImagePath = Join-Path $BundleRoot "images\taklite-offline.tar"
+$OfflineImageName = "taklite-taklite:offline"
 $ProjectName = "taklite"
 
 function New-TAKliteToken {
@@ -170,6 +172,10 @@ function Write-TAKliteEnvironment {
         if (-not (Test-UsableIPv4 -Address $envBindIp) -or $envBindIp -ne $BindIp) {
             throw "Existing .env is configured for WG_BIND_IP='$envBindIp', but this install selected '$BindIp'. Rerun with -EnvMode Recreate to regenerate Windows Docker settings."
         }
+        if ((Test-Path -LiteralPath $OfflineImagePath -PathType Leaf) -and -not $envValues.ContainsKey("TAKLITE_IMAGE")) {
+            Add-Content -LiteralPath $EnvironmentPath -Value "TAKLITE_IMAGE=$OfflineImageName"
+            Write-Host "Added offline image setting to existing .env."
+        }
         Write-Host "Using existing .env for $envBindIp. Use -EnvMode Recreate to regenerate Windows Docker settings."
         return
     }
@@ -182,6 +188,7 @@ function Write-TAKliteEnvironment {
     $bootstrapToken = New-TAKliteToken
     $lines = @(
         "WG_BIND_IP=$BindIp",
+        "TAKLITE_IMAGE=$OfflineImageName",
         "TAKLITE_PUBLIC_HOST=$BindIp",
         "TAKLITE_SERVER_HOST=$BindIp",
         "TAKLITE_CONTAINER_USER=10001:10001",
@@ -257,7 +264,17 @@ function Invoke-TAKliteCompose {
         throw "TAKlite Docker Compose configuration is invalid."
     }
 
-    & docker compose --project-name $ProjectName --env-file $EnvironmentPath --file $ComposeFile up --detach --build
+    if (Test-Path -LiteralPath $OfflineImagePath -PathType Leaf) {
+        Write-Host "Loading bundled TAKlite Docker image. This can take a minute..."
+        & docker load --input $OfflineImagePath
+        if ($LASTEXITCODE -ne 0) {
+            throw "TAKlite offline Docker image failed to load."
+        }
+        & docker compose --project-name $ProjectName --env-file $EnvironmentPath --file $ComposeFile up --detach --no-build
+    } else {
+        Write-Host "No offline image found. Building TAKlite locally; this requires internet access for Docker base images if they are not already cached."
+        & docker compose --project-name $ProjectName --env-file $EnvironmentPath --file $ComposeFile up --detach --build
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "TAKlite container failed to start."
     }

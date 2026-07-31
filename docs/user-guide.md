@@ -406,7 +406,7 @@ ss -tulpn | grep -E '(:8080|:8443|:58087|:8089|:10086|:51820)'
 
 Common issues:
 
-- Portal login invalid: confirm the user was created under Connection Users, not Connection Packages.
+- Portal login invalid: confirm the user exists under Users and has not been revoked.
 - Invalid truststore: create a fresh Connection User after deploy and import the newest `.dp.zip`.
 - Red TAK connection: confirm VPN is connected, use `10.66.66.1:8089:ssl`, and watch logs for `cert_cn=...`.
 - Datapackage send fails: confirm the TAK client has the server connection from the `.dp.zip` and can reach `10.66.66.1:8080` plus the configured HTTPS/Marti port, usually `8443`.

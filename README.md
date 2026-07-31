@@ -101,13 +101,25 @@ cd TAKlite
 
 Windows Docker Desktop LAN install:
 
-Download and extract the Windows Docker Desktop release asset, then double-click:
+Download and extract the Windows Docker Desktop offline release asset, then double-click:
 
 ```text
 Install TAKlite.cmd
 ```
 
-The Windows installer selects an existing Windows IPv4 address, binds TAKlite to it, starts Docker Desktop if needed, and creates scoped Windows Firewall rules for the TAKlite TCP ports. WireGuard is optional in this mode and must be handled separately.
+The Windows installer selects an existing Windows IPv4 address, binds TAKlite to it, starts Docker Desktop if needed, loads the bundled Docker image from `images\taklite-offline.tar`, and creates scoped Windows Firewall rules for the TAKlite TCP ports. WireGuard is optional in this mode and must be handled separately.
+
+The Windows offline bundle also includes clickable helpers:
+
+```text
+Show Bootstrap Token.cmd
+Smoke Test TAKlite.cmd
+Update TAKlite.cmd
+Reinstall TAKlite.cmd
+Uninstall TAKlite.cmd
+```
+
+For Windows offline updates, place the newer TAKlite Windows offline release zip in the extracted bundle's `update` folder, then double-click `Update TAKlite.cmd`. The updater preserves `.env`, users, certs, datapackages, generated packages, and the local database.
 
 Docker Desktop GUI:
 
@@ -138,7 +150,7 @@ Plain CoT:   10.66.66.1:58087
 4. Open WGDashboard and TAKlite over the VPN.
 5. Create the first TAKlite admin account with the bootstrap token.
 6. Use WGDashboard to create device VPN peers.
-7. Use TAKlite Connection Users to create ATAK/WinTAK `.dp.zip` bundles, either one at a time or with Create Bulk Users.
+7. Use TAKlite Users to create ATAK/WinTAK `.dp.zip` bundles, either one at a time or with Create Bulk Users.
 8. Give users WireGuard QR plus TAKlite portal QR/link and password.
 9. Test PLI, chat, marker drops, and datapackages.
 

@@ -227,7 +227,7 @@ Check:
 
 - Admin login still works.
 - Existing Connection Users still appear.
-- Existing Connection Packages still appear.
+- Existing user connection packages still appear.
 - Existing datapackages still appear.
 - ATAK/WinTAK clients reconnect.
 - PLI, chat, markers, and datapackages still work.

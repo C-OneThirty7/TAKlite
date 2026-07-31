@@ -1,5 +1,6 @@
 services:
   taklite:
+    image: "${TAKLITE_IMAGE:-taklite-taklite:latest}"
     build:
       context: .
       dockerfile: ./docker/taklite/Dockerfile

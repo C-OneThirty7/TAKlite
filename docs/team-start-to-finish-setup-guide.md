@@ -1,6 +1,6 @@
 # TAKlite Start-To-Finish Setup Guide
 
-Version: TAKlite v0.2.22
+Version: TAKlite v0.2.23
 
 Audience: new TAKlite administrators standing up a fresh VPS.
 
@@ -643,25 +643,28 @@ Actions:
 
 Use this to confirm phone-to-server, WinTAK-to-server, and server-to-client datapackage transfer.
 
-## 16. Connection Packages
+## 16. User Connection Packages
 
 Open:
 
 ```text
-Connection Packages
+Users
 ```
 
-This creates standalone `.dp.zip` packages without a portal username/password.
+This is the primary place to create and manage ATAK/WinTAK connection packages.
 
-Use this for testing or special cases. For normal users, prefer `Users`, because portal users are easier to revoke, reissue, and track.
+For normal users, create Connection Users. They are easier to revoke, reissue, reset, track, and distribute through QR/link plus a password.
 
 Actions:
 
-- `Create DP.zip`: create a standalone ATAK/WinTAK connection package
-- `Download`: download the package
-- `Copy URL`: copy the VPN-only direct package URL
-- `Revoke`: disable the package
-- `Delete`: remove the package record and generated files
+- `Create User`: create one portal user and matching ATAK/WinTAK `.dp.zip`
+- `Create Bulk Users`: create many portal users and packages at once
+- `Download DP.zip`: download the user's current connection package
+- `Copy URL`: copy the user's VPN-only portal link
+- `QR`: show a portal QR code
+- `Reissue`: revoke the old package and create a fresh one
+- `Revoke`: disable the user and revoke their certificate package
+- `Delete`: remove the user record and generated package files
 
 ## 17. Access Control Basics
 
@@ -820,7 +823,7 @@ Expected health output includes:
 
 ```text
 "ok": true
-"version": "TAKlite 0.2.22"
+"version": "TAKlite 0.2.23"
 "auth_enabled": true
 ```
 

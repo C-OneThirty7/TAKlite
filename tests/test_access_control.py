@@ -6,6 +6,7 @@ import tempfile
 import threading
 import urllib.request
 import unittest
+import xml.etree.ElementTree as ET
 import zipfile
 from unittest import mock
 
@@ -129,6 +130,32 @@ class AccessControlTests(unittest.TestCase):
         self.assertEqual([item["name"] for item in summary["roles"]], ["Range Lead"])
         self.assertEqual([item["name"] for item in summary["groups"]], ["Blue Team"])
 
+    def test_plugin_bootstrap_profile_returns_ip_bound_user(self):
+        user = self.service.create_policy_subject("device-one")
+        with self.service.db_connect() as conn:
+            conn.execute("update portal_users set assigned_ip = ? where id = ?", ("127.0.0.1", user["id"]))
+            conn.commit()
+        server = self.service.ThreadingHTTPServer(("127.0.0.1", 0), self.service.HttpHandler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        try:
+            request = urllib.request.Request(f"http://127.0.0.1:{server.server_port}/api/plugin/bootstrap/profile")
+            with urllib.request.urlopen(request, timeout=5) as response:
+                profile = json.loads(response.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=5)
+
+        self.assertEqual(profile["schema"], "taklite-plugin-profile-v1")
+        self.assertEqual(profile["name"], "device-one")
+        self.assertTrue(profile["plugin_token"].startswith("tlp_"))
+        events = self.service.list_audit_events(event_type="plugin_profile_bootstrap")
+        self.assertEqual(events[0]["outcome"], "ok")
+        self.assertEqual(events[0]["reason_code"], "profile_returned")
+        self.assertEqual(events[0]["actor_name"], "device-one")
+
     def test_tls_identity_maps_to_portal_user_and_filters_cot_delivery(self):
         participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
         observer = self.service.create_access_role("Observer", can_see_all=True, can_send_all=True)
@@ -178,6 +205,248 @@ class AccessControlTests(unittest.TestCase):
         self.assertTrue(self.service.package_visible_to_user(package, lead["id"], enforce=True))
         self.assertFalse(self.service.package_visible_to_user(package, bravo_one["id"], enforce=True))
         self.assertTrue(self.service.package_visible_to_user(package, None, enforce=False))
+
+    def test_access_levels_limit_visibility_inside_allowed_groups(self):
+        participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+
+        level_one = self.service.create_policy_subject("alpha-one", role_id=participant["id"], group_ids=[alpha["id"]], access_level=1)
+        level_two = self.service.create_policy_subject("alpha-two", role_id=participant["id"], group_ids=[alpha["id"]], access_level=2)
+        level_four = self.service.create_policy_subject("alpha-four", role_id=participant["id"], group_ids=[alpha["id"]], access_level=4)
+
+        self.assertTrue(self.service.can_subject_see(level_one["id"], level_one["id"]))
+        self.assertFalse(self.service.can_subject_see(level_one["id"], level_two["id"]))
+        self.assertTrue(self.service.can_subject_see(level_two["id"], level_one["id"]))
+        self.assertFalse(self.service.can_subject_send(level_two["id"], level_four["id"]))
+        self.assertTrue(self.service.can_subject_send(level_four["id"], level_one["id"]))
+
+    def test_level_tagged_datapackage_filters_after_sender_policy(self):
+        participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
+        observer = self.service.create_access_role("Observer", can_see_all=True, can_send_all=True)
+        alpha = self.service.create_access_group("Alpha")
+        bravo = self.service.create_access_group("Bravo")
+
+        lead = self.service.create_policy_subject("lead", role_id=observer["id"], access_level=4)
+        alpha_four = self.service.create_policy_subject("alpha-four", role_id=participant["id"], group_ids=[alpha["id"]], access_level=4)
+        alpha_two = self.service.create_policy_subject("alpha-two", role_id=participant["id"], group_ids=[alpha["id"]], access_level=2)
+        bravo_four = self.service.create_policy_subject("bravo-four", role_id=participant["id"], group_ids=[bravo["id"]], access_level=4)
+
+        package = {
+            "CreatorUserId": alpha_four["id"],
+            "Tool": "private",
+            "PolicyMode": "level_only",
+            "AllowedLevels": [4],
+        }
+
+        self.assertTrue(self.service.package_visible_to_user(package, alpha_four["id"], enforce=True))
+        self.assertTrue(self.service.package_visible_to_user(package, lead["id"], enforce=True))
+        self.assertFalse(self.service.package_visible_to_user(package, alpha_two["id"], enforce=True))
+        self.assertFalse(self.service.package_visible_to_user(package, bravo_four["id"], enforce=True))
+
+        blocked = self.service.package_access_for_user(package, alpha_two["id"], enforce=True)
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["reason_code"], "blocked_level_policy")
+
+    def test_datapackage_policy_update_and_preview_explain_access(self):
+        participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+        creator = self.service.create_policy_subject("alpha-four", role_id=participant["id"], group_ids=[alpha["id"]], access_level=4)
+        level_four = self.service.create_policy_subject("alpha-four-b", role_id=participant["id"], group_ids=[alpha["id"]], access_level=4)
+        level_two = self.service.create_policy_subject("alpha-two", role_id=participant["id"], group_ids=[alpha["id"]], access_level=2)
+
+        payload = b"PK\x05\x06" + (b"\0" * 18)
+        self.service.upsert_package("policyhash", "maps.dp.zip", "ANDROID-1", payload, "http://127.0.0.1", creator_user_id=creator["id"])
+
+        updated = self.service.update_datapackage_policy("policyhash", "level_only", [4])
+        self.assertEqual(updated["package"]["PolicyLabel"], "Level 4 only")
+
+        preview = self.service.datapackage_access_preview("policyhash")
+        by_user = {item["username"]: item for item in preview["items"]}
+        self.assertTrue(by_user["alpha-four-b"]["allowed"])
+        self.assertFalse(by_user["alpha-two"]["allowed"])
+        self.assertEqual(by_user["alpha-two"]["reason_code"], "blocked_level_policy")
+        self.assertEqual(preview["allowed_count"], 2)
+
+    def test_datapackage_preview_explains_receive_policy_block(self):
+        sender_role = self.service.create_access_role("Sender", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=True)
+        receive_blocked_role = self.service.create_access_role("No Receive", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=False)
+        alpha = self.service.create_access_group("Alpha")
+        sender = self.service.create_policy_subject("sender", role_id=sender_role["id"], group_ids=[alpha["id"]])
+        blocked = self.service.create_policy_subject("blocked", role_id=receive_blocked_role["id"], group_ids=[alpha["id"]])
+
+        package = {"CreatorUserId": sender["id"], "Tool": "private", "PolicyMode": "sender", "AllowedLevels": []}
+        access = self.service.package_access_for_user(package, blocked["id"], enforce=True)
+
+        self.assertFalse(access["allowed"])
+        self.assertEqual(access["reason_code"], "blocked_receive_policy")
+        self.assertTrue(self.service.can_subject_send(sender["id"], blocked["id"]))
+        self.assertFalse(self.service.can_subject_receive(blocked["id"], sender["id"]))
+
+    def test_plugin_audience_allows_receive_without_pli_visibility(self):
+        trusted_role = self.service.create_access_role("Trusted", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=True)
+        external_role = self.service.create_access_role("External", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=True)
+        trusted_group = self.service.create_access_group("Trusted")
+        external_group = self.service.create_access_group("External")
+        sender = self.service.create_policy_subject("trusted-one", role_id=trusted_role["id"], group_ids=[trusted_group["id"]])
+        receiver = self.service.create_policy_subject("external-one", role_id=external_role["id"], group_ids=[external_group["id"]])
+
+        self.service.set_policy_link(trusted_group["id"], external_group["id"], can_see=False, can_send=True, can_receive=True)
+        self.assertFalse(self.service.can_subject_see(receiver["id"], sender["id"]))
+        self.assertTrue(self.service.can_send_datapackage(sender["id"], receiver["id"]))
+
+        audience = self.service.plugin_datapackage_audience(sender["id"], {
+            "audience_mode": "specific_users",
+            "user_ids": [receiver["id"]],
+        })
+
+        self.assertIn(receiver["id"], audience["allowed_user_ids"])
+        by_user = {item["username"]: item for item in audience["items"]}
+        self.assertEqual(by_user["external-one"]["reason_code"], "allowed_plugin_policy")
+
+    def test_plugin_send_records_explicit_recipients_and_blocks_others(self):
+        role = self.service.create_access_role("Operator", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+        sender = self.service.create_policy_subject("sender", role_id=role["id"], group_ids=[alpha["id"]])
+        target = self.service.create_policy_subject("target", role_id=role["id"], group_ids=[alpha["id"]])
+        other = self.service.create_policy_subject("other", role_id=role["id"], group_ids=[alpha["id"]])
+        payload = b"PK\x05\x06" + (b"\0" * 18)
+        self.service.upsert_package("pluginhash", "plugin-maps.dp.zip", "ANDROID-sender", payload, "http://127.0.0.1", creator_user_id=sender["id"])
+
+        with mock.patch.object(self.service.RELAY, "send_to_user_ids", return_value={"sent": 0, "results": [], "missed_user_ids": [target["id"]]}):
+            result = self.service.plugin_send_datapackage(sender["id"], {
+                "hash": "pluginhash",
+                "audience_mode": "specific_users",
+                "user_ids": [target["id"]],
+            })
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(self.service.package_explicit_recipient_ids("pluginhash"), {target["id"]})
+        package = self.service.row_to_package(self.service.find_package("pluginhash"))
+        self.assertTrue(self.service.package_visible_to_user(package, target["id"], enforce=True))
+        self.assertTrue(self.service.package_visible_to_user(package, sender["id"], enforce=True))
+        blocked = self.service.package_access_for_user(package, other["id"], enforce=True)
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["reason_code"], "blocked_explicit_audience")
+
+    def test_plugin_token_auth_context_and_preview_helpers(self):
+        role = self.service.create_access_role("Operator", can_see_own_groups=True, can_send_own_groups=True, can_receive_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+        sender = self.service.create_policy_subject("sender", role_id=role["id"], group_ids=[alpha["id"]])
+        target = self.service.create_policy_subject("target", role_id=role["id"], group_ids=[alpha["id"]])
+        sender_row = self.service.portal_user_row(self.service.find_portal_user(sender["id"]))
+        token_row = self.service.find_portal_user_by_plugin_token(sender_row["plugin_api_token"])
+        user = self.service.portal_user_row(token_row)
+        context = self.service.plugin_context_for_user(user)
+        preview = self.service.plugin_datapackage_audience(sender["id"], {
+            "audience_mode": "specific_users",
+            "user_ids": [target["id"]],
+        })
+
+        self.assertEqual(context["user"]["username"], "sender")
+        self.assertFalse(context["capabilities"]["broad_access"])
+        self.assertFalse(context["capabilities"]["can_see_all"])
+        self.assertTrue(context["capabilities"]["can_send_own_groups"])
+        self.assertTrue(context["capabilities"]["can_receive_own_groups"])
+        self.assertIn("specific_users", {item["id"] for item in context["audience_modes"]})
+        self.assertEqual(preview["allowed_user_ids"], [target["id"]])
+
+        broad_role = self.service.create_access_role("Broad", can_see_all=True, can_send_all=True, can_receive_all=True)
+        broad = self.service.create_policy_subject("broad", role_id=broad_role["id"])
+        broad_user = self.service.portal_user_row(self.service.find_portal_user(broad["id"]))
+        broad_context = self.service.plugin_context_for_user(broad_user)
+        self.assertTrue(broad_context["capabilities"]["broad_access"])
+        self.assertTrue(broad_context["capabilities"]["can_see_all"])
+        self.assertTrue(broad_context["capabilities"]["can_send_all"])
+        self.assertTrue(broad_context["capabilities"]["can_receive_all"])
+
+    def test_device_binding_finds_exact_ip_and_optional_mac(self):
+        first = self.service.create_policy_subject("device-one")
+        second = self.service.create_policy_subject("device-two")
+        with self.service.db_connect() as conn:
+            conn.execute("update portal_users set assigned_ip = ?, device_mac = ? where id = ?", ("10.66.66.23", "aa:bb:cc:dd:ee:ff", first["id"]))
+            conn.execute("update portal_users set assigned_ip = ? where id = ?", ("10.66.66.24", second["id"]))
+            conn.commit()
+
+        self.assertEqual(self.service.validate_device_mac("AABB.CCDD.EEFF"), "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(self.service.find_portal_user_by_device_binding("10.66.66.23", "aa-bb-cc-dd-ee-ff")["username"], "device-one")
+        self.assertIsNone(self.service.find_portal_user_by_device_binding("10.66.66.23"))
+        self.assertEqual(self.service.find_portal_user_by_device_binding("10.66.66.24")["username"], "device-two")
+
+        with self.service.db_connect() as conn:
+            conn.execute("update portal_users set assigned_ip = ? where id = ?", ("10.66.66.24", first["id"]))
+            conn.commit()
+        self.assertIsNone(self.service.find_portal_user_by_device_binding("10.66.66.24"))
+
+    def test_admin_datapackage_send_records_offline_pending_delivery(self):
+        creator = self.service.create_policy_subject("creator")
+        target = self.service.create_policy_subject("target")
+        payload = b"PK\x05\x06" + (b"\0" * 18)
+        self.service.upsert_package("sendhash", "maps.dp.zip", "ANDROID-1", payload, "http://127.0.0.1", creator_user_id=creator["id"])
+
+        with mock.patch.object(self.service.RELAY, "send_to_user_ids", return_value={"sent": 0, "results": [], "missed_user_ids": [target["id"]]}):
+            result = self.service.send_datapackage_to_clients({"hash": "sendhash", "user_ids": [target["id"]]})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent"], 0)
+        self.assertEqual(result["pending"], 1)
+        self.assertEqual(result["results"][0]["reason_code"], "pending_offline")
+
+        deliveries = self.service.list_datapackage_deliveries("sendhash")
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["status"], "pending")
+        self.assertEqual(deliveries[0]["target_user_id"], target["id"])
+
+    def test_admin_datapackage_send_records_successful_user_delivery(self):
+        creator = self.service.create_policy_subject("creator")
+        target = self.service.create_policy_subject("target")
+        payload = b"PK\x05\x06" + (b"\0" * 18)
+        self.service.upsert_package("senthash", "maps.dp.zip", "ANDROID-1", payload, "http://127.0.0.1", creator_user_id=creator["id"])
+
+        relay_result = {
+            "sent": 1,
+            "results": [{
+                "user_id": target["id"],
+                "username": "target",
+                "uid": "ANDROID-target",
+                "callsign": "TARGET",
+                "ip": "10.66.66.8",
+                "sent": True,
+                "reason_code": "sent",
+                "reason": "File-share event sent to connected client.",
+            }],
+            "missed_user_ids": [],
+        }
+        with mock.patch.object(self.service.RELAY, "send_to_user_ids", return_value=relay_result):
+            result = self.service.send_datapackage_to_clients({"hash": "senthash", "user_ids": [target["id"]]})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["sent"], 1)
+        self.assertEqual(result["pending"], 0)
+        self.assertEqual(result["results"][0]["status"], "sent")
+
+        deliveries = self.service.list_datapackage_deliveries("senthash")
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(deliveries[0]["status"], "sent")
+        self.assertEqual(deliveries[0]["target_uid"], "ANDROID-target")
+
+    def test_datapackage_filename_policy_parser_accepts_field_names(self):
+        self.assertEqual(
+            self.service.parse_datapackage_filename_policy("maps__lvl4ONLY.dp.zip"),
+            {"mode": "level_only", "allowed_levels": [4], "label": "Level 4 only"},
+        )
+        self.assertEqual(
+            self.service.parse_datapackage_filename_policy("maps__tl-lvl4-all.dp.zip")["allowed_levels"],
+            [1, 2, 3, 4],
+        )
+        self.assertEqual(
+            self.service.parse_datapackage_filename_policy("maps__lvl4and2ONLY.dp.zip")["allowed_levels"],
+            [2, 4],
+        )
+        self.assertEqual(
+            self.service.parse_datapackage_filename_policy("maps.dp.zip")["mode"],
+            "sender",
+        )
 
     def test_public_tool_datapackage_is_visible_without_identity(self):
         package = {"CreatorUserId": None, "Visibility": "private", "Tool": "public"}
@@ -259,7 +528,7 @@ class AccessControlTests(unittest.TestCase):
 
         with mock.patch.object(self.service, "ensure_truststore_file", return_value=truststore), \
              mock.patch.object(self.service, "run_openssl", side_effect=fake_openssl):
-            profile = self.service.create_cert_profile("alpha-phone", "test")
+            profile = self.service.create_cert_profile("alpha-phone", "test", plugin_token="tlp_testprofiletoken1234567890")
 
         package = cert_dir / profile["datapackage_file"]
         with zipfile.ZipFile(package) as zf:
@@ -277,19 +546,37 @@ class AccessControlTests(unittest.TestCase):
         with zipfile.ZipFile(package) as zf:
             server_pref = zf.read("certs/server.pref").decode("utf-8")
             manifest = zf.read("MANIFEST/manifest.xml").decode("utf-8")
+            plugin_config = json.loads(zf.read("certs/taklite-plugin.json").decode("utf-8"))
         self.assertIn('<entry key="description0" class="class java.lang.String">TAKlite alpha-phone</entry>', server_pref)
+        self.assertEqual(ET.fromstring(server_pref).tag, "preferences")
         self.assertIn('<entry key="caLocation0" class="class java.lang.String">cert/10.66.66.1.p12</entry>', server_pref)
         self.assertIn('<entry key="certificateLocation0" class="class java.lang.String">cert/alpha-phone.p12</entry>', server_pref)
-        self.assertIn('<entry key="caLocation" class="class java.lang.String">cert/10.66.66.1.p12</entry>', server_pref)
-        self.assertIn('<entry key="certificateLocation" class="class java.lang.String">cert/alpha-phone.p12</entry>', server_pref)
-        self.assertIn('<entry key="caPassword" class="class java.lang.String">atakatak</entry>', server_pref)
-        self.assertIn('<entry key="clientPassword" class="class java.lang.String">atakatak</entry>', server_pref)
+        self.assertNotIn('<entry key="caLocation" class="class java.lang.String">', server_pref)
+        self.assertNotIn('<entry key="certificateLocation" class="class java.lang.String">', server_pref)
+        self.assertNotIn('<entry key="caPassword" class="class java.lang.String">', server_pref)
+        self.assertNotIn('<entry key="clientPassword" class="class java.lang.String">', server_pref)
         self.assertIn('<entry key="apiSecureServerPort" class="class java.lang.String">8443</entry>', server_pref)
         self.assertIn('<entry key="apiUnsecureServerPort" class="class java.lang.String">8080</entry>', server_pref)
         self.assertIn('<Parameter name="onReceiveImport" value="true"/>', manifest)
         self.assertIn('<Content ignore="false" zipEntry="certs/server.pref"/>', manifest)
+        self.assertIn('<Content ignore="false" zipEntry="certs/taklite-plugin.json"/>', manifest)
         self.assertIn('<Content ignore="false" zipEntry="certs/10.66.66.1.p12"/>', manifest)
         self.assertIn('<Content ignore="false" zipEntry="certs/alpha-phone.p12"/>', manifest)
+        self.assertIn("certs/taklite-plugin.json", names)
+        self.assertEqual(plugin_config["schema"], "taklite-plugin-profile-v1")
+        self.assertEqual(plugin_config["name"], "alpha-phone")
+        self.assertEqual(plugin_config["server_url"], "http://10.66.66.1:8080")
+        self.assertEqual(plugin_config["server_urls"], ["http://10.66.66.1:8080", "https://10.66.66.1:8443"])
+        self.assertEqual(plugin_config["connect_string"], "10.66.66.1:8089:ssl")
+        self.assertEqual(plugin_config["ports"]["http"], 8080)
+        self.assertEqual(plugin_config["ports"]["https"], 8443)
+        self.assertEqual(plugin_config["ports"]["cot_tls"], 8089)
+        self.assertEqual(plugin_config["plugin_token"], "tlp_testprofiletoken1234567890")
+        self.assertEqual(plugin_config["default_audience_mode"], "all_allowed")
+        self.assertEqual(plugin_config["api"]["me"], "/api/plugin/me")
+        self.assertEqual(plugin_config["api"]["preview"], "/api/plugin/datapackages/preview")
+        self.assertEqual(plugin_config["api"]["upload"], "/api/plugin/datapackages/upload")
+        self.assertEqual(plugin_config["api"]["send"], "/api/plugin/datapackages/send")
         pkcs12_calls = [call for call in openssl_calls if call[:2] == ["pkcs12", "-export"]]
         self.assertEqual(len(pkcs12_calls), 1)
         self.assertIn("-certpbe", pkcs12_calls[0])

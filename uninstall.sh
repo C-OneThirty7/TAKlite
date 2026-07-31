@@ -123,9 +123,31 @@ stop_wireguard() {
 }
 
 remove_fail2ban_config() {
-  log "Removing TAKlite fail2ban jail"
-  rm -f /etc/fail2ban/jail.d/taklite-vps.local
+  log "Removing TAKlite fail2ban jails"
+  rm -f \
+    /etc/fail2ban/jail.d/taklite-vps.local \
+    /etc/fail2ban/jail.d/taklite-auth.local \
+    /etc/fail2ban/filter.d/taklite-auth.conf
   systemctl restart fail2ban >/dev/null 2>&1 || true
+}
+
+remove_host_runners() {
+  log "Removing TAKlite host runner services"
+  systemctl disable --now \
+    taklite-gui-update.path \
+    taklite-settings.path \
+    taklite-firewall.path >/dev/null 2>&1 || true
+  rm -f \
+    /etc/systemd/system/taklite-gui-update.path \
+    /etc/systemd/system/taklite-gui-update.service \
+    /etc/systemd/system/taklite-settings.path \
+    /etc/systemd/system/taklite-settings.service \
+    /etc/systemd/system/taklite-firewall.path \
+    /etc/systemd/system/taklite-firewall.service \
+    /usr/local/sbin/taklite-gui-update-runner \
+    /usr/local/sbin/taklite-settings-runner \
+    /usr/local/sbin/taklite-firewall-runner
+  systemctl daemon-reload >/dev/null 2>&1 || true
 }
 
 remove_files() {
@@ -191,6 +213,7 @@ main() {
   stop_wgdashboard
   stop_wireguard
   remove_fail2ban_config
+  remove_host_runners
   remove_files
 
   log "Uninstall complete. TAKlite, WGDashboard, WireGuard config, and TAKlite state were removed."

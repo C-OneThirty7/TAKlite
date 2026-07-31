@@ -46,6 +46,24 @@ Install TAKlite.cmd
 
 Approve the Windows administrator prompt. The command launcher runs the TAKlite PowerShell installer for you.
 
+Most day-to-day maintenance also has clickable launchers:
+
+```text
+Show Bootstrap Token.cmd
+Smoke Test TAKlite.cmd
+Update TAKlite.cmd
+Reinstall TAKlite.cmd
+Uninstall TAKlite.cmd
+```
+
+The offline release asset includes:
+
+```text
+images\taklite-offline.tar
+```
+
+When that image file is present, the installer loads the bundled Docker image and starts TAKlite without building from the internet. If that file is missing, the installer falls back to an online Docker build and may need HTTPS access to Docker Hub, Ubuntu package mirrors, and npm.
+
 If Windows blocks the downloaded files, right-click the extracted folder, open Properties, and unblock it if that option is shown. If Windows does not show an unblock checkbox but still blocks scripts, open PowerShell in the extracted folder and run:
 
 ```powershell
@@ -75,7 +93,8 @@ The Windows installer:
 - writes `.env` for Docker Desktop mode;
 - binds TAKlite to the selected Windows IPv4 address;
 - creates scoped Windows Firewall rules for the TAKlite TCP ports;
-- builds and starts TAKlite with Docker Compose.
+- loads the bundled offline image when present;
+- starts TAKlite with Docker Compose.
 
 The installer does not rewrite Windows networking. If the selected IP is wrong, fix Windows networking first, then rerun the installer.
 
@@ -127,7 +146,7 @@ Plain CoT:    WINDOWS_HOST_IP:58087
 
 Open the TAKlite dashboard and use the bootstrap token to create the first admin account.
 
-Then create Connection Users or Connection Packages in TAKlite and import the generated `.dp.zip` into ATAK/WinTAK.
+Then open `Users`, create a connection user, and import that user's generated `.dp.zip` into ATAK/WinTAK.
 
 The certificate password defaults to:
 
@@ -205,3 +224,23 @@ taklite\data
 taklite\packages
 taklite\certs
 ```
+
+## Update
+
+For offline Windows updates:
+
+1. Keep the current TAKlite folder in place.
+2. Copy the newer `TAKlite-windows-docker-offline-vX.Y.Z.zip` into the current folder's `update` directory.
+3. Double-click `Update TAKlite.cmd`.
+
+The updater extracts the newest zip in `update`, loads the bundled Docker image, copies updated application files, and preserves:
+
+- `.env`
+- users
+- admin account
+- certs
+- datapackages
+- generated connection packages
+- local database
+
+If the current bundle is old enough that it does not have `Update TAKlite.cmd`, extract the newer bundle beside it and run the newer installer with the same bind IP, or copy the newer files over the old folder while preserving `.env` and the `taklite` runtime folder.

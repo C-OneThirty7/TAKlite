@@ -1,6 +1,6 @@
 # TAKlite Access Control Guide
 
-Version: TAKlite v0.2.22
+Version: TAKlite v0.2.23
 
 ## Purpose
 
@@ -22,7 +22,7 @@ Think of TAKlite access control in three layers:
 ```text
 Role   = what broad powers a user has
 Group  = what team or visibility bucket a user belongs to
-Link   = whether one group can see/send to another group
+Link   = whether one group can see/send to, and be received by, another group
 ```
 
 Each connection user can have:
@@ -88,7 +88,7 @@ Groups are not permission levels by themselves. They are membership buckets. The
 
 ### Link
 
-A link controls cross-group visibility and send ability.
+A link controls cross-group visibility, send ability, and receive ability.
 
 No link means groups stay isolated from each other unless a user's role has a global permission such as "Can see everyone."
 
@@ -98,13 +98,13 @@ Links are directional:
 Alpha -> Bravo
 ```
 
-means Alpha can see and send to Bravo. Bravo does not automatically see and send to Alpha.
+means Alpha can see Bravo, send to Bravo, and Bravo can receive that path. Bravo does not automatically see or send to Alpha.
 
 ```text
 Two Way
 ```
 
-means Alpha can see/send Bravo, and Bravo can see/send Alpha.
+means Alpha and Bravo can see, send, and receive both directions.
 
 ## Role Permissions
 
@@ -260,7 +260,24 @@ When TAKlite decides whether User A can see User B, it checks:
 4. Is there a link from one of User A's groups to one of User B's groups with see enabled? If yes, allowed.
 5. Otherwise, not allowed.
 
-Send permission works the same way, but uses the send switches and send links.
+Send permission works the same way, but uses the send switches and send links. Receive permission is checked separately for datapackages, so a recipient can be allowed to see a sender while still refusing package delivery from that sender.
+
+## How Access Levels Work
+
+Access levels are optional. If a user has no level assigned, TAKlite keeps using the normal role/group/link rules.
+
+When levels are assigned, they act like a simple ladder inside the permissions that already exist:
+
+- Level 1 can see/send Level 1.
+- Level 2 can see/send Level 2 and Level 1.
+- Level 3 can see/send Level 3, Level 2, and Level 1.
+- Level 4 can see/send Level 4, Level 3, Level 2, and Level 1.
+
+Receiving is not limited by the recipient's level. This allows a Level 1 user to receive a package sent by a Level 4 user when the sender, receiver, role, and group rules allow that path.
+
+Groups still matter. A Level 4 user in Alpha does not automatically see Bravo unless their role can see everyone or Alpha is linked to Bravo.
+
+Use levels when a team needs rank-based visibility inside the same group. Use roles for broad powers such as "can see everyone". Use groups for team membership.
 
 ## How Datapackage Visibility Works
 
@@ -270,10 +287,59 @@ In general:
 
 - Public datapackages are visible to users.
 - Private datapackages are visible to the creator.
-- A private package from another user is visible when the requester can see the creator and the creator can send to the requester.
+- A private package from another user is visible when the requester can see the creator, the creator can send to the requester, and the requester can receive from the creator.
 - Admins with broad see/send roles can manage packages from the admin panel.
 
+Filename tags can narrow who sees a package uploaded from ATAK/WinTAK without changing the TAK client.
+
+Examples:
+
+```text
+maps__lvl4ONLY.dp.zip
+maps__lvl4ALL.dp.zip
+brief__lvl4and2ONLY.dp.zip
+```
+
+The tag behavior is:
+
+- `lvl4ONLY` means only Level 4 users can query/download that package.
+- `lvl4ALL` means Levels 4, 3, 2, and 1 can query/download that package.
+- `lvl4and2ONLY` means only Level 4 and Level 2 users can query/download that package.
+- Untagged packages follow the sender's normal role/group/link visibility policy.
+
+TAKlite still enforces the sender and receiver policy after reading the filename tag. For example, an Alpha package tagged `lvl4ONLY` is limited to allowed Level 4 users; it does not automatically cross into Bravo unless the role/group/link policy allows that path.
+
+TAKlite also prevents lower-level users from creating higher-level tagged packages. For example, a Level 2 user cannot upload a package named `brief__lvl4ONLY.dp.zip`.
+
 If datapackage behavior feels unexpected, use Access Preview first. If the two users do not appear in the expected "Can See", "Can Send To", "Seen By", or "Can Receive From" lists, adjust roles/groups/links before retesting in ATAK.
+
+## Admin Package Send
+
+The Datapackages panel can upload a `.zip` or `.dp.zip` from the admin computer and can send any stored package to selected connection users.
+
+The normal workflow is:
+
+1. Open Datapackages.
+2. Upload the file, or choose an existing stored package.
+3. Use Send to select online or offline connection users.
+4. Review the send result for sent, pending, blocked, or failed targets.
+
+The admin send action checks the same rules:
+
+1. The package creator must be allowed to send to the selected user.
+2. The selected user must be allowed to receive from the package creator.
+3. Explicit recipient lists, when present, limit package query/download to the selected users and the creator.
+
+If the selected user is online, TAKlite sends the file-share notification immediately. If the selected user is offline, TAKlite records the delivery as pending and tries to push the notification when that user reconnects.
+
+The send result explains each target:
+
+- `sent` means the connected client socket accepted the file-share notification.
+- `pending_offline` means the user is allowed but not currently connected.
+- `blocked_sender_policy` means the package creator cannot send to the selected user.
+- `blocked_receive_policy` means the selected user cannot receive from the package creator.
+- `blocked_explicit_audience` means the selected user is outside that package's explicit recipient list.
+- `blocked_receive_policy` means the selected user cannot receive from the package creator.
 
 ## Access Enforcement
 
@@ -714,13 +780,21 @@ If a user cannot send to another user:
 3. Is there a directional link from the sender's group to the receiver's group?
 4. Does Access Preview show the receiver under Can Send To?
 
+If a user cannot receive from another user:
+
+1. Does the receiver have "Can receive everyone"?
+2. Do both users share a group and does the receiver role have "Can receive assigned groups"?
+3. Is there a directional link from the sender's group to the receiver's group?
+4. Does Access Preview show the sender under Can Receive From?
+
 If datapackage search or download is confusing:
 
 1. Check whether the package is public or private.
 2. Check who created it.
 3. Preview whether the requester can see the creator.
 4. Preview whether the creator can send to the requester.
-5. Test admin panel package send if needed.
+5. Preview whether the requester can receive from the creator.
+6. Test admin panel package send if needed.
 
 ## Field-Test Matrix
 
@@ -735,7 +809,7 @@ Before an event, test one device per policy type.
 | Beacon previews Student | Not visible |
 | Instructor previews Beacon | Visible |
 | Alpha -> Beacon link enabled | Alpha sees Beacon |
-| Alpha <-> Bravo Two Way enabled | Alpha and Bravo see/send both directions |
+| Alpha <-> Bravo Two Way enabled | Alpha and Bravo see/send/receive both directions |
 
 ## Recommended Defaults
 

@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity,
-  Boxes,
   Copy,
   Download,
   ExternalLink,
@@ -21,6 +20,7 @@ import {
   Settings,
   ShieldCheck,
   Trash2,
+  Upload,
   UserPlus,
   Users,
   Wifi,
@@ -35,7 +35,6 @@ const navItems = [
   ['clients', Wifi, 'Clients'],
   ['datapackages', FileArchive, 'Datapackages'],
   ['users', Users, 'Users'],
-  ['packages', Boxes, 'Connection Packages'],
   ['access', ShieldCheck, 'Access'],
   ['firewall', ShieldCheck, 'Firewall'],
   ['settings', Settings, 'Settings'],
@@ -143,6 +142,7 @@ function App() {
     portalUsers: [],
     access: { roles: [], groups: [], links: [] },
     systemHealth: null,
+    auditEvents: [],
     portalUrl: '',
     certPassword: '',
   });
@@ -165,13 +165,14 @@ function App() {
     setLoading(true);
     try {
       const health = await fetch('/api/health').then((r) => r.json());
-      const [packages, clients, profiles, portal, access, systemHealth] = await Promise.all([
+      const [packages, clients, profiles, portal, access, systemHealth, auditEvents] = await Promise.all([
         api('/api/datapackages', session),
         api('/api/clients', session),
         api('/api/cert-profiles', session),
         api('/api/portal-users', session),
         api('/api/access-control', session),
         api('/api/system-health', session),
+        api('/api/audit-events?limit=25', session),
       ]);
       setData({
         health,
@@ -181,6 +182,7 @@ function App() {
         portalUsers: portal.items || [],
         access: access || { roles: [], groups: [], links: [] },
         systemHealth,
+        auditEvents: auditEvents.items || [],
         portalUrl: portal.portal_url || `${location.origin}/connect/`,
         certPassword: profiles.cert_password || '',
       });
@@ -213,7 +215,7 @@ function App() {
     } catch {}
     localStorage.removeItem(SESSION_KEY);
     setSession('');
-    setData({ health: null, clients: [], packages: [], profiles: [], portalUsers: [], access: { roles: [], groups: [], links: [] }, systemHealth: null, portalUrl: '', certPassword: '' });
+    setData({ health: null, clients: [], packages: [], profiles: [], portalUsers: [], access: { roles: [], groups: [], links: [] }, systemHealth: null, auditEvents: [], portalUrl: '', certPassword: '' });
     await loadBootstrap();
   };
 
@@ -272,11 +274,10 @@ function App() {
         <OverviewStrip data={data} />
 
         {active === 'overview' && <Overview data={data} session={session} load={load} setStatus={setStatus} />}
-        {active === 'health' && <HealthPanel health={data.systemHealth} />}
+        {active === 'health' && <HealthPanel health={data.systemHealth} auditEvents={data.auditEvents} />}
         {active === 'clients' && <ClientsPanel clients={data.clients} />}
-        {active === 'datapackages' && <DatapackagesPanel packages={data.packages} clients={data.clients} session={session} load={load} setStatus={setStatus} />}
-        {active === 'users' && <UsersPanel users={data.portalUsers} access={data.access} portalUrl={data.portalUrl} session={session} load={load} setStatus={setStatus} />}
-        {active === 'packages' && <ProfilesPanel profiles={data.profiles} certPassword={data.certPassword} session={session} load={load} setStatus={setStatus} />}
+        {active === 'datapackages' && <DatapackagesPanel packages={data.packages} clients={data.clients} users={data.portalUsers} session={session} load={load} setStatus={setStatus} />}
+        {active === 'users' && <UsersPanel users={data.portalUsers} access={data.access} portalUrl={data.portalUrl} certPassword={data.certPassword} session={session} load={load} setStatus={setStatus} />}
         {active === 'access' && <AccessPanel users={data.portalUsers} access={data.access} session={session} load={load} setStatus={setStatus} />}
         {active === 'firewall' && <FirewallPanel session={session} setStatus={setStatus} />}
         {active === 'settings' && <SettingsPanel health={data.systemHealth} wgUrl={wgUrl} session={session} load={load} setStatus={setStatus} />}
@@ -356,7 +357,6 @@ function OverviewStrip({ data }) {
     ['Clients', String(data.clients.length), Wifi],
     ['Datapackages', String(data.packages.length), FileArchive],
     ['Users', String(data.portalUsers.length), Users],
-    ['Packages', String(data.profiles.length), Boxes],
     ['Access', String((data.access?.roles?.length || 0) + (data.access?.groups?.length || 0)), ShieldCheck],
   ];
   return (
@@ -390,7 +390,7 @@ function Overview({ data, session, load, setStatus }) {
   );
 }
 
-function HealthPanel({ health }) {
+function HealthPanel({ health, auditEvents = [] }) {
   if (!health) return <Panel title="Server Health" icon={Gauge} wide><Empty title="Health loading" detail="Refresh the dashboard to reload service health." /></Panel>;
   const database = health.database || {};
   const storage = health.storage || {};
@@ -423,6 +423,9 @@ function HealthPanel({ health }) {
           <HealthMetric label="WG Dashboard" value={health.wireguard?.dashboard_url || '-'} />
         </div>
       </Panel>
+      <Panel title="Recent Audit" icon={Activity} wide>
+        <AuditEvents events={auditEvents} />
+      </Panel>
       {database.error ? (
         <Panel title="Health Error" icon={XCircle} wide>
           <div className="error-box">{database.error}</div>
@@ -430,6 +433,55 @@ function HealthPanel({ health }) {
       ) : null}
     </div>
   );
+}
+
+function AuditEvents({ events }) {
+  if (!events.length) return <Empty title="No audit events" detail="Recent profile, package, and policy actions will appear here." />;
+  return (
+    <div className="table-wrap">
+      <table className="audit-table">
+        <thead>
+          <tr><th>Time</th><th>Event</th><th>Actor</th><th>Result</th><th>Detail</th></tr>
+        </thead>
+        <tbody>
+          {events.map((event) => (
+            <tr key={event.id}>
+              <td>{fmtTime(event.occurred_at)}</td>
+              <td><code>{event.event_type}</code></td>
+              <td>{event.actor_name || event.actor_type || event.remote || '-'}</td>
+              <td><Badge tone={auditTone(event.outcome)}>{event.outcome || 'ok'}</Badge></td>
+              <td>
+                <span>{event.reason_code || '-'}</span>
+                <small>{auditDetail(event)}</small>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function auditTone(outcome) {
+  if (outcome === 'ok') return 'good';
+  if (outcome === 'failed') return 'bad';
+  if (outcome === 'blocked') return 'warn';
+  return 'neutral';
+}
+
+function auditDetail(event) {
+  const details = event.details || {};
+  const parts = [];
+  if (details.name) parts.push(details.name);
+  if (details.filename) parts.push(details.filename);
+  if (details.hash) parts.push(`hash ${String(details.hash).slice(0, 12)}`);
+  if (details.mode) parts.push(`mode ${details.mode}`);
+  if (details.sent != null) parts.push(`${details.sent} sent`);
+  if (details.pending != null) parts.push(`${details.pending} queued`);
+  if (details.blocked != null) parts.push(`${details.blocked} blocked`);
+  if (details.failed != null) parts.push(`${details.failed} failed`);
+  if (details.error) parts.push(details.error);
+  return parts.join(' / ');
 }
 
 function SettingsPanel({ health, wgUrl, session, load, setStatus }) {
@@ -1003,16 +1055,60 @@ function ClientsTable({ clients, compact = false }) {
   );
 }
 
-function DatapackagesPanel({ packages, clients, session, load, setStatus }) {
+function DatapackagesPanel({ packages, clients, users, session, load, setStatus }) {
   return (
     <Panel title="Datapackages" icon={FileArchive} wide>
-      <DatapackagesTable packages={packages} clients={clients} session={session} load={load} setStatus={setStatus} />
+      <UploadDatapackagePanel session={session} load={load} setStatus={setStatus} />
+      <DatapackagesTable packages={packages} clients={clients} users={users} session={session} load={load} setStatus={setStatus} />
     </Panel>
   );
 }
 
-function DatapackagesTable({ packages, clients = [], session, load, setStatus, compact = false }) {
+function UploadDatapackagePanel({ session, load, setStatus }) {
+  const [file, setFile] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const upload = async (event) => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    if (!file) {
+      setStatus('Choose a .zip or .dp.zip file to upload.');
+      return;
+    }
+    setUploading(true);
+    try {
+      const response = await fetch(`/api/datapackages/upload?filename=${encodeURIComponent(file.name)}`, {
+        method: 'POST',
+        headers: {
+          ...authHeaders(session),
+          'Content-Type': 'application/zip',
+        },
+        body: file,
+      });
+      const body = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(body.error || response.statusText);
+      setStatus(`Uploaded ${body.package?.Name || file.name}. Use Send to select recipients.`);
+      setFile(null);
+      form.reset();
+      await load();
+    } catch (error) {
+      setStatus(`Upload failed: ${error.message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+  return (
+    <form className="upload-strip" onSubmit={upload}>
+      <label>Admin upload<input type="file" accept=".zip,.dp.zip,application/zip" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
+      <button className="btn primary" type="submit" disabled={!file || uploading}><Upload size={16} />{uploading ? 'Uploading' : 'Upload DP.zip'}</button>
+      <span className="hint">Uploaded files use server policy controls and can be sent to selected users.</span>
+    </form>
+  );
+}
+
+function DatapackagesTable({ packages, clients = [], users = [], session, load, setStatus, compact = false }) {
   const [sendPackage, setSendPackage] = useState(null);
+  const [policyPackage, setPolicyPackage] = useState(null);
+  const [previewPackage, setPreviewPackage] = useState(null);
   if (!packages.length) return <Empty title="No datapackages" detail="Uploaded packages from TAK clients will appear here." />;
   return (
     <>
@@ -1024,6 +1120,7 @@ function DatapackagesTable({ packages, clients = [], session, load, setStatus, c
               {!compact && <th>Hash</th>}
               <th>Size</th>
               <th>Tool</th>
+              {!compact && <th>Policy</th>}
               <th>Submitted</th>
               {!compact && <th>Creator</th>}
               <th>Action</th>
@@ -1036,12 +1133,15 @@ function DatapackagesTable({ packages, clients = [], session, load, setStatus, c
                 {!compact && <td><code>{pkg.Hash}</code></td>}
                 <td>{fmtBytes(pkg.Size)}</td>
                 <td><Badge>{pkg.Tool || 'public'}</Badge></td>
+                {!compact && <td><Badge>{pkg.PolicyLabel || 'Sender policy'}</Badge></td>}
                 <td>{fmtTime(pkg.SubmissionDateTime)}</td>
                 {!compact && <td><code>{pkg.CreatorUid || '-'}</code></td>}
                 <td>
                   <div className="row-actions">
                     <a className="icon-btn" href={`/Marti/sync/content?hash=${encodeURIComponent(pkg.Hash)}`} download={pkg.Name} title="Download"><Download size={15} /></a>
                     {!compact && <button className="icon-btn" title="Send to clients" onClick={() => setSendPackage(pkg)}><Send size={15} /></button>}
+                    {!compact && <button className="icon-btn" title="Edit package policy" onClick={() => setPolicyPackage(pkg)}><Pencil size={15} /></button>}
+                    {!compact && <button className="icon-btn" title="Preview package access" onClick={() => setPreviewPackage(pkg)}><ShieldCheck size={15} /></button>}
                     <button className="icon-btn danger" title="Delete" onClick={() => deletePackage(pkg, session, load, setStatus)}><Trash2 size={15} /></button>
                   </div>
                 </td>
@@ -1054,29 +1154,151 @@ function DatapackagesTable({ packages, clients = [], session, load, setStatus, c
         <SendDatapackagePanel
           pkg={sendPackage}
           clients={clients}
+          users={users}
           session={session}
           setStatus={setStatus}
           onClose={() => setSendPackage(null)}
+        />
+      ) : null}
+      {policyPackage ? (
+        <PackagePolicyPanel
+          pkg={policyPackage}
+          session={session}
+          load={load}
+          setStatus={setStatus}
+          onClose={() => setPolicyPackage(null)}
+        />
+      ) : null}
+      {previewPackage ? (
+        <PackageAccessPreviewPanel
+          pkg={previewPackage}
+          session={session}
+          setStatus={setStatus}
+          onClose={() => setPreviewPackage(null)}
         />
       ) : null}
     </>
   );
 }
 
-function SendDatapackagePanel({ pkg, clients, session, setStatus, onClose }) {
-  const selectableClients = clients.filter((client) => client.uid);
-  const [selected, setSelected] = useState(() => selectableClients.map((client) => client.uid));
+function PackagePolicyPanel({ pkg, session, load, setStatus, onClose }) {
+  const [mode, setMode] = useState(pkg.PolicyMode || 'sender');
+  const [levels, setLevels] = useState((pkg.AllowedLevels || []).map(String));
+  const selected = new Set(levels);
+  const toggleLevel = (level) => {
+    const next = new Set(levels);
+    if (next.has(level)) next.delete(level);
+    else next.add(level);
+    setLevels([...next].sort());
+  };
+  const save = async () => {
+    await api('/api/datapackages/policy', session, {
+      method: 'POST',
+      body: JSON.stringify({
+        hash: pkg.Hash,
+        mode,
+        allowed_levels: mode === 'sender' ? [] : levels,
+      }),
+    });
+    setStatus(`Updated package policy for ${pkg.Name}.`);
+    await load();
+    onClose();
+  };
+  return (
+    <div className="send-panel policy-panel">
+      <div>
+        <h3>Edit Package Policy</h3>
+        <p>{pkg.Name}</p>
+      </div>
+      <label>Policy<select value={mode} onChange={(event) => setMode(event.target.value)}>
+        <option value="sender">Sender policy</option>
+        <option value="level_only">Specific levels only</option>
+        <option value="level_all">Highest selected and below</option>
+      </select></label>
+      {mode !== 'sender' ? (
+        <div className="group-picks">
+          {['1', '2', '3', '4'].map((level) => (
+            <label className="check group-chip" key={level}>
+              <input type="checkbox" checked={selected.has(level)} onChange={() => toggleLevel(level)} />
+              Level {level}
+            </label>
+          ))}
+        </div>
+      ) : (
+        <PanelHint>Untagged/default behavior: the package follows the creator&apos;s normal role, group, link, and level policy.</PanelHint>
+      )}
+      <div className="send-actions">
+        <button className="btn primary" type="button" onClick={save} disabled={mode !== 'sender' && !levels.length}><ShieldCheck size={16} />Apply Policy</button>
+        <button className="btn ghost" type="button" onClick={onClose}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function PackageAccessPreviewPanel({ pkg, session, setStatus, onClose }) {
+  const [preview, setPreview] = useState(null);
+  useEffect(() => {
+    let cancelled = false;
+    api(`/api/datapackages/preview?hash=${encodeURIComponent(pkg.Hash)}`, session)
+      .then((body) => { if (!cancelled) setPreview(body); })
+      .catch((error) => setStatus(`Package access preview failed: ${error.message}`));
+    return () => { cancelled = true; };
+  }, [pkg.Hash, session, setStatus]);
+  return (
+    <div className="send-panel package-preview-panel">
+      <div>
+        <h3>Package Access Preview</h3>
+        <p>{pkg.Name}</p>
+      </div>
+      {!preview ? (
+        <Empty title="Loading preview" detail="Checking TAKlite policy against connection users." />
+      ) : (
+        <>
+          <div className="preview-summary">
+            <Badge tone="good">{preview.allowed_count} allowed</Badge>
+            <Badge tone={preview.blocked_count ? 'warn' : 'good'}>{preview.blocked_count} blocked</Badge>
+            <Badge>{preview.policy?.label || 'Sender policy'}</Badge>
+          </div>
+          <div className="package-preview-list">
+            {preview.items.map((item) => (
+              <div className={item.allowed ? 'package-preview-row allowed' : 'package-preview-row blocked'} key={item.user_id}>
+                <span>
+                  <strong>{item.username}</strong>
+                  <small>{item.role_name || 'no role'}{item.access_level ? ` / Level ${item.access_level}` : ' / no level'}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
+                </span>
+                <Badge tone={item.allowed ? 'good' : 'warn'}>{item.allowed ? 'allowed' : 'blocked'}</Badge>
+                <small>{item.reason}</small>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+      <div className="send-actions">
+        <button className="btn ghost" type="button" onClick={onClose}>Close</button>
+      </div>
+    </div>
+  );
+}
+
+function SendDatapackagePanel({ pkg, clients, users, session, setStatus, onClose }) {
+  const connectedByUsername = new Map((clients || []).filter((client) => client.username).map((client) => [client.username, client]));
+  const selectableUsers = (users || []).filter((user) => !user.revoked);
+  const onlineUserIds = selectableUsers
+    .filter((user) => connectedByUsername.has(user.username))
+    .map((user) => user.id);
+  const [selected, setSelected] = useState([]);
+  const [result, setResult] = useState(null);
   const selectedSet = new Set(selected);
-  const toggle = (uid) => {
-    setSelected((current) => current.includes(uid) ? current.filter((item) => item !== uid) : [...current, uid]);
+  const toggle = (userId) => {
+    setSelected((current) => current.includes(userId) ? current.filter((item) => item !== userId) : [...current, userId]);
   };
   const send = async () => {
-    const result = await api('/api/datapackages/send', session, {
+    const body = await api('/api/datapackages/send', session, {
       method: 'POST',
-      body: JSON.stringify({ hash: pkg.Hash, client_uids: selected }),
+      body: JSON.stringify({ hash: pkg.Hash, user_ids: selected }),
     });
-    setStatus(`Sent ${pkg.Name} to ${result.sent} connected client(s).`);
-    onClose();
+    setResult(body);
+    setStatus(`Package send: ${body.sent || 0} sent, ${body.pending || 0} pending, ${body.blocked || 0} blocked, ${body.failed || 0} failed.`);
   };
   return (
     <div className="send-panel">
@@ -1084,25 +1306,52 @@ function SendDatapackagePanel({ pkg, clients, session, setStatus, onClose }) {
         <h3>Send Datapackage</h3>
         <p>{pkg.Name}</p>
       </div>
-      {!selectableClients.length ? (
-        <Empty title="No active clients" detail="Clients appear here after ATAK or WinTAK sends CoT traffic." />
+      {!selectableUsers.length ? (
+        <Empty title="No connection users" detail="Create connection users before sending packages from the admin panel." />
       ) : (
         <>
           <div className="send-actions">
-            <button className="btn ghost" type="button" onClick={() => setSelected(selectableClients.map((client) => client.uid))}>Select All</button>
+            <button className="btn ghost" type="button" onClick={() => setSelected(onlineUserIds)}>Select Online</button>
+            <button className="btn ghost" type="button" onClick={() => setSelected(selectableUsers.map((user) => user.id))}>Select All</button>
             <button className="btn ghost" type="button" onClick={() => setSelected([])}>Clear</button>
           </div>
           <div className="client-check-list">
-            {selectableClients.map((client) => (
-              <label className={selectedSet.has(client.uid) ? 'client-check selected' : 'client-check'} key={client.uid}>
-                <input type="checkbox" checked={selectedSet.has(client.uid)} onChange={() => toggle(client.uid)} />
+            {selectableUsers.map((user) => {
+              const client = connectedByUsername.get(user.username);
+              return (
+              <label className={selectedSet.has(user.id) ? 'client-check selected' : 'client-check'} key={user.id}>
+                <input type="checkbox" checked={selectedSet.has(user.id)} onChange={() => toggle(user.id)} />
                 <span>
-                  <strong>{client.callsign || 'Unknown'}</strong>
-                  <small>{client.uid} · {client.ip || 'no ip'}</small>
+                  <strong>{user.display_name || user.username}</strong>
+                  <small>{client ? `${client.callsign || 'Connected'} · ${client.ip || 'no ip'}` : 'offline - store and forward'}</small>
                 </span>
+                <Badge tone={client ? 'good' : 'neutral'}>{client ? 'online' : 'offline'}</Badge>
               </label>
-            ))}
+              );
+            })}
           </div>
+          {result ? (
+            <div className="delivery-results">
+              <div className="preview-summary">
+                <Badge tone="good">{result.sent || 0} sent</Badge>
+                <Badge tone={(result.pending || 0) ? 'warn' : 'neutral'}>{result.pending || 0} pending</Badge>
+                <Badge tone={(result.blocked || 0) ? 'warn' : 'neutral'}>{result.blocked || 0} blocked</Badge>
+                <Badge tone={(result.failed || 0) ? 'warn' : 'neutral'}>{result.failed || 0} failed</Badge>
+              </div>
+              <div className="package-preview-list">
+                {(result.results || []).map((item) => (
+                  <div className={item.status === 'sent' ? 'package-preview-row allowed' : 'package-preview-row blocked'} key={`${item.user_id}-${item.reason_code}`}>
+                    <span>
+                      <strong>{item.username || `user ${item.user_id}`}</strong>
+                      <small>{item.status}</small>
+                    </span>
+                    <Badge tone={item.status === 'sent' ? 'good' : 'warn'}>{item.reason_code}</Badge>
+                    <small>{item.reason}</small>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : null}
           <div className="send-actions">
             <button className="btn primary" type="button" onClick={send} disabled={!selected.length}><Send size={16} />Send to {selected.length}</button>
             <button className="btn ghost" type="button" onClick={onClose}>Cancel</button>
@@ -1156,14 +1405,14 @@ async function deleteGroup(group, session, load, setStatus) {
   await load();
 }
 
-function UsersPanel({ users, access, portalUrl, session, load, setStatus }) {
+function UsersPanel({ users, access, portalUrl, certPassword, session, load, setStatus }) {
   const [showBulk, setShowBulk] = useState(false);
   return (
-    <Panel title="Connection Users" icon={Users} wide actions={<span className="hint">Portal: <code>{portalUrl}</code></span>}>
+    <Panel title="Connection Users" icon={Users} wide actions={<span className="hint">Portal: <code>{portalUrl}</code> · Cert password: <code>{certPassword}</code></span>}>
       <CreateUser access={access} session={session} load={load} setStatus={setStatus} />
       <div className="panel-tools">
         <button className="btn ghost" type="button" onClick={() => setShowBulk(!showBulk)}><Users size={16} />Create Bulk Users</button>
-        <span className="hint">Bulk users receive one shared portal password for the batch.</span>
+        <span className="hint">Each user automatically gets a portal login, QR link, and ATAK/WinTAK DP.zip. TAKlite learns IP/device details after first connection when possible.</span>
       </div>
       {showBulk && <CreateBulkUsers access={access} session={session} load={load} setStatus={setStatus} />}
       <UsersTable users={users} portalUrl={portalUrl} session={session} load={load} setStatus={setStatus} />
@@ -1171,10 +1420,23 @@ function UsersPanel({ users, access, portalUrl, session, load, setStatus }) {
   );
 }
 
+function AccessLevelSelect({ value, onChange, emptyLabel = 'No level' }) {
+  return (
+    <select value={value || ''} onChange={(event) => onChange(event.target.value)}>
+      <option value="">{emptyLabel}</option>
+      <option value="1">Level 1</option>
+      <option value="2">Level 2</option>
+      <option value="3">Level 3</option>
+      <option value="4">Level 4</option>
+    </select>
+  );
+}
+
 function CreateUser({ access, session, load, setStatus }) {
   const roles = access?.roles || [];
   const groups = access?.groups || [];
-  const [form, setForm] = useState({ username: '', password: '', description: '', allow_redownload: false, role_id: '', group_ids: [] });
+  const blankForm = { username: '', password: '', description: '', allow_redownload: false, role_id: '', access_level: '', group_ids: [] };
+  const [form, setForm] = useState(blankForm);
   const toggleGroup = (id) => {
     const groupIds = new Set(form.group_ids);
     if (groupIds.has(id)) groupIds.delete(id);
@@ -1185,7 +1447,7 @@ function CreateUser({ access, session, load, setStatus }) {
     event.preventDefault();
     await api('/api/portal-users/create', session, { method: 'POST', body: JSON.stringify({ ...form, role_id: form.role_id || null }) });
     setStatus(`Connection user ${form.username} created.`);
-    setForm({ username: '', password: '', description: '', allow_redownload: false, role_id: '', group_ids: [] });
+    setForm(blankForm);
     await load();
   };
   return (
@@ -1197,6 +1459,7 @@ function CreateUser({ access, session, load, setStatus }) {
         <option value="">No role</option>
         {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
       </select></label>
+      <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
       <div className="group-picks compact">
         {groups.map((group) => (
           <label className="check group-chip" key={group.id}>
@@ -1207,6 +1470,7 @@ function CreateUser({ access, session, load, setStatus }) {
       </div>
       <label className="check"><input type="checkbox" checked={form.allow_redownload} onChange={(e) => setForm({ ...form, allow_redownload: e.target.checked })} /> Allow re-download</label>
       <button className="btn primary" type="submit"><UserPlus size={16} />Create User</button>
+      <div className="form-note">Assigned IP and Device ID are learned from TAK/Axon traffic when the user connects. Use Edit later only when you need to override or pre-bind a profile.</div>
     </form>
   );
 }
@@ -1214,7 +1478,7 @@ function CreateUser({ access, session, load, setStatus }) {
 function CreateBulkUsers({ access, session, load, setStatus }) {
   const roles = access?.roles || [];
   const groups = access?.groups || [];
-  const [form, setForm] = useState({ prefix: 'user', count: 20, description: '', allow_redownload: false, role_id: '', group_ids: [] });
+  const [form, setForm] = useState({ prefix: 'user', count: 20, description: '', allow_redownload: false, role_id: '', access_level: '', group_ids: [] });
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const toggleGroup = (id) => {
@@ -1247,6 +1511,7 @@ function CreateBulkUsers({ access, session, load, setStatus }) {
           <option value="">No role</option>
           {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
         </select></label>
+        <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
         <label className="check"><input type="checkbox" checked={form.allow_redownload} onChange={(e) => setForm({ ...form, allow_redownload: e.target.checked })} /> Allow re-download</label>
         <button className="btn primary" type="submit" disabled={busy}><UserPlus size={16} />{busy ? 'Creating...' : 'Create Batch'}</button>
       </form>
@@ -1312,30 +1577,30 @@ function AccessPanel({ users, access, session, load, setStatus }) {
   const links = access?.links || [];
   return (
     <div className="dashboard-grid">
-      <Panel title="User Membership" icon={UserPlus} wide>
-        <PanelHint>Choose each user&apos;s role and group membership. Roles define broad permissions; groups define who users can see by default.</PanelHint>
-        <UserAccessTable users={users} roles={roles} groups={groups} session={session} load={load} setStatus={setStatus} />
-      </Panel>
       <Panel title="Bulk Membership" icon={Users} wide>
-        <PanelHint>Select multiple users, then apply one role or group change to the whole selection.</PanelHint>
+        <PanelHint>Select multiple users, then apply role, level, or group changes to the whole selection.</PanelHint>
         <BulkAccess users={users} roles={roles} groups={groups} session={session} load={load} setStatus={setStatus} />
+      </Panel>
+      <Panel title="Individual Membership" icon={UserPlus} wide>
+        <PanelHint>Fine-tune one user&apos;s role, level, and group membership after the bulk pass.</PanelHint>
+        <UserAccessTable users={users} roles={roles} groups={groups} session={session} load={load} setStatus={setStatus} />
       </Panel>
       <Panel title="Access Preview" icon={ShieldCheck} wide>
         <PanelHint>Pick a user to verify who they can see, who can see them, and send permissions before testing on devices.</PanelHint>
         <AccessPreview users={users} session={session} setStatus={setStatus} />
       </Panel>
-      <Panel title="Role Permissions" icon={ShieldCheck}>
-        <PanelHint>Use roles for permission levels. An admin-style role can see everyone without being visible to everyone else.</PanelHint>
+      <Panel title="Role Templates" icon={ShieldCheck}>
+        <PanelHint>Roles are reusable permission templates. A high-trust role can see everyone without becoming visible to everyone else.</PanelHint>
         <CreateRole session={session} load={load} setStatus={setStatus} />
         <RolesTable roles={roles} session={session} load={load} setStatus={setStatus} />
       </Panel>
-      <Panel title="Groups" icon={Users}>
-        <PanelHint>Use groups for teams or visibility buckets such as Alpha, Bravo, Admin, or Beacon.</PanelHint>
+      <Panel title="Teams / Groups" icon={Users}>
+        <PanelHint>Groups are the normal team buckets users belong to. Users in the same group can see/send/receive when their role allows assigned-group access.</PanelHint>
         <CreateGroup session={session} load={load} setStatus={setStatus} />
         <GroupsTable groups={groups} session={session} load={load} setStatus={setStatus} />
       </Panel>
-      <Panel title="Visibility Links" icon={Link2} wide>
-        <PanelHint>Link groups only when one group should see and send to another. No link means groups stay isolated unless a role has see-all/send-all.</PanelHint>
+      <Panel title="Team Links" icon={Link2} wide>
+        <PanelHint>Links connect separate groups. No link means groups stay isolated unless a role has global see/send/receive permissions.</PanelHint>
         <GroupLinks groups={groups} links={links} session={session} load={load} setStatus={setStatus} />
       </Panel>
     </div>
@@ -1396,7 +1661,7 @@ function PreviewList({ title, items }) {
       {items?.length ? items.map((item) => (
         <div className="preview-user" key={`${title}-${item.id}`}>
           <span>{item.username}</span>
-          <small>{item.role_name || 'no role'}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
+          <small>{item.role_name || 'no role'}{item.access_level ? ` / Level ${item.access_level}` : ''}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
         </div>
       )) : <span className="hint">None</span>}
     </div>
@@ -1409,15 +1674,17 @@ function CreateRole({ session, load, setStatus }) {
     description: '',
     can_see_all: false,
     can_send_all: false,
+    can_receive_all: false,
     can_see_own_groups: true,
     can_send_own_groups: true,
+    can_receive_own_groups: true,
   });
   const submit = async (event) => {
     event.preventDefault();
     try {
       await api('/api/access-roles/create', session, { method: 'POST', body: JSON.stringify(form) });
       setStatus(`Role ${form.name} created.`);
-      setForm({ name: '', description: '', can_see_all: false, can_send_all: false, can_see_own_groups: true, can_send_own_groups: true });
+      setForm({ name: '', description: '', can_see_all: false, can_send_all: false, can_receive_all: false, can_see_own_groups: true, can_send_own_groups: true, can_receive_own_groups: true });
       await load();
     } catch (error) {
       setStatus(`Role create failed: ${error.message}`);
@@ -1430,8 +1697,10 @@ function CreateRole({ session, load, setStatus }) {
       <div className="check-row">
         <label className="check"><input type="checkbox" checked={form.can_see_all} onChange={(e) => setForm({ ...form, can_see_all: e.target.checked })} /> Can see everyone</label>
         <label className="check"><input type="checkbox" checked={form.can_send_all} onChange={(e) => setForm({ ...form, can_send_all: e.target.checked })} /> Can send to everyone</label>
+        <label className="check"><input type="checkbox" checked={form.can_receive_all} onChange={(e) => setForm({ ...form, can_receive_all: e.target.checked })} /> Can receive from everyone</label>
         <label className="check"><input type="checkbox" checked={form.can_see_own_groups} onChange={(e) => setForm({ ...form, can_see_own_groups: e.target.checked })} /> Can see assigned groups</label>
         <label className="check"><input type="checkbox" checked={form.can_send_own_groups} onChange={(e) => setForm({ ...form, can_send_own_groups: e.target.checked })} /> Can send to assigned groups</label>
+        <label className="check"><input type="checkbox" checked={form.can_receive_own_groups} onChange={(e) => setForm({ ...form, can_receive_own_groups: e.target.checked })} /> Can receive from assigned groups</label>
       </div>
       <button className="btn primary" type="submit"><ShieldCheck size={16} />Create Role</button>
     </form>
@@ -1461,8 +1730,10 @@ function RolesTable({ roles, session, load, setStatus }) {
                 <div className="check-row compact">
                   <label className="check"><input type="checkbox" checked={role.can_see_all} onChange={(e) => updateRole(role, { can_see_all: e.target.checked })} /> See everyone</label>
                   <label className="check"><input type="checkbox" checked={role.can_send_all} onChange={(e) => updateRole(role, { can_send_all: e.target.checked })} /> Send everyone</label>
+                  <label className="check"><input type="checkbox" checked={role.can_receive_all} onChange={(e) => updateRole(role, { can_receive_all: e.target.checked })} /> Receive everyone</label>
                   <label className="check"><input type="checkbox" checked={role.can_see_own_groups} onChange={(e) => updateRole(role, { can_see_own_groups: e.target.checked })} /> See assigned</label>
                   <label className="check"><input type="checkbox" checked={role.can_send_own_groups} onChange={(e) => updateRole(role, { can_send_own_groups: e.target.checked })} /> Send assigned</label>
+                  <label className="check"><input type="checkbox" checked={role.can_receive_own_groups} onChange={(e) => updateRole(role, { can_receive_own_groups: e.target.checked })} /> Receive assigned</label>
                 </div>
               </td>
               <td>
@@ -1528,7 +1799,7 @@ function GroupsTable({ groups, session, load, setStatus }) {
 }
 
 function BulkAccess({ users, roles, groups, session, load, setStatus }) {
-  const [form, setForm] = useState({ filter: '', role_id: '', group_ids: [], group_mode: 'replace', selected_user_ids: [] });
+  const [form, setForm] = useState({ filter: '', role_id: '', access_level: '', level_mode: 'unchanged', group_ids: [], group_mode: 'replace', selected_user_ids: [] });
   const filter = form.filter.trim().toLowerCase();
   const matched = users.filter((user) => {
     if (!filter) return true;
@@ -1576,6 +1847,8 @@ function BulkAccess({ users, roles, groups, session, load, setStatus }) {
         body: JSON.stringify({
           user_ids: selectedUsers.map((user) => user.id),
           role_id: form.role_id || null,
+          access_level: form.access_level || null,
+          level_mode: form.level_mode,
           group_ids: form.group_ids,
           group_mode: form.group_mode,
         }),
@@ -1594,6 +1867,12 @@ function BulkAccess({ users, roles, groups, session, load, setStatus }) {
           <option value="">Leave role unchanged</option>
           {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
         </select></label>
+        <label>Level action<select value={form.level_mode} onChange={(e) => setForm({ ...form, level_mode: e.target.value })}>
+          <option value="unchanged">Leave level unchanged</option>
+          <option value="set">Set level</option>
+          <option value="clear">Clear level</option>
+        </select></label>
+        {form.level_mode === 'set' && <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} emptyLabel="Choose level" /></label>}
         <label>Group action<select value={form.group_mode} onChange={(e) => setForm({ ...form, group_mode: e.target.value })}>
           <option value="replace">Replace groups</option>
           <option value="add">Add groups</option>
@@ -1636,6 +1915,7 @@ function UserSelectionList({ users, selectedIds, toggleUser }) {
           </span>
           <span className="user-access-summary">
             {user.role_name ? <Badge>{user.role_name}</Badge> : <Badge>no role</Badge>}
+            {user.access_level ? <Badge>Level {user.access_level}</Badge> : <Badge>no level</Badge>}
             {(user.groups || []).length ? user.groups.map((group) => <Badge key={group.id}>{group.name}</Badge>) : <Badge>no groups</Badge>}
           </span>
         </label>
@@ -1653,6 +1933,7 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
       user.id,
       {
         role_id: user.role_id || '',
+        access_level: user.access_level || '',
         group_ids: [...(user.group_ids || [])],
       },
     ])));
@@ -1674,14 +1955,14 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
     setDrafts((current) => ({
       ...current,
       [userId]: {
-        ...(current[userId] || { role_id: '', group_ids: [] }),
+        ...(current[userId] || { role_id: '', access_level: '', group_ids: [] }),
         ...patch,
       },
     }));
   };
 
   const toggleDraftGroup = (userId, groupId) => {
-    const draft = drafts[userId] || { role_id: '', group_ids: [] };
+    const draft = drafts[userId] || { role_id: '', access_level: '', group_ids: [] };
     const groupIds = new Set(draft.group_ids || []);
     if (groupIds.has(groupId)) groupIds.delete(groupId);
     else groupIds.add(groupId);
@@ -1689,13 +1970,14 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
   };
 
   const saveUser = async (user) => {
-    const draft = drafts[user.id] || { role_id: '', group_ids: [] };
+    const draft = drafts[user.id] || { role_id: '', access_level: '', group_ids: [] };
     try {
       await api('/api/access-users/set', session, {
         method: 'POST',
         body: JSON.stringify({
           user_id: user.id,
           role_id: draft.role_id || null,
+          access_level: draft.access_level || null,
           group_ids: draft.group_ids || [],
         }),
       });
@@ -1717,11 +1999,11 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
       <div className="table-wrap">
         <table className="access-table individual-access-table">
           <thead>
-            <tr><th>User</th><th>Role</th><th>Groups</th><th>Action</th></tr>
+            <tr><th>User</th><th>Role</th><th>Level</th><th>Groups</th><th>Action</th></tr>
           </thead>
           <tbody>
             {filtered.map((user) => {
-              const draft = drafts[user.id] || { role_id: user.role_id || '', group_ids: user.group_ids || [] };
+              const draft = drafts[user.id] || { role_id: user.role_id || '', access_level: user.access_level || '', group_ids: user.group_ids || [] };
               return (
                 <tr key={user.id}>
                   <td>
@@ -1733,6 +2015,9 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
                       <option value="">No role</option>
                       {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
                     </select>
+                  </td>
+                  <td>
+                    <AccessLevelSelect value={draft.access_level || ''} onChange={(value) => updateDraft(user.id, { access_level: value })} />
                   </td>
                   <td>
                     <div className="group-picks compact">
@@ -1766,7 +2051,7 @@ function GroupLinks({ groups, links, session, load, setStatus }) {
   });
   const linkEnabled = (sourceId, targetId) => {
     const link = findLink(sourceId, targetId);
-    return Boolean(link.can_see && link.can_send);
+    return Boolean(link.can_see && link.can_send && link.can_receive);
   };
   const pairMode = (source, target) => {
     const forward = linkEnabled(source.id, target.id);
@@ -1784,6 +2069,7 @@ function GroupLinks({ groups, links, session, load, setStatus }) {
         target_group_id: targetId,
         can_see: enabled,
         can_send: enabled,
+        can_receive: enabled,
       }),
     });
   };
@@ -1834,6 +2120,7 @@ function UsersTable({ users, session, load, setStatus, compact = false }) {
             <th>Status</th>
             {!compact && <th>Role</th>}
             {!compact && <th>Groups</th>}
+            {!compact && <th>Learned Device</th>}
             <th>Connection</th>
             {!compact && <th>Downloads</th>}
             {!compact && <th>Re-download</th>}
@@ -1855,6 +2142,7 @@ function UsersTable({ users, session, load, setStatus, compact = false }) {
                     </div>
                   </td>
                 )}
+                {!compact && <td><code>{user.assigned_ip || 'IP not learned'}</code><span>{user.device_mac || 'Device ID not learned'}</span></td>}
                 <td><code>{user.connect_string || '-'}</code><br /><code>{url}</code></td>
                 {!compact && <td>{user.download_count || 0}<span>last {fmtTime(user.last_download_at)}</span></td>}
                 {!compact && <td>{user.allow_redownload ? 'yes' : 'no'}</td>}
@@ -1873,6 +2161,7 @@ function UserActions({ user, url, session, load, setStatus, compact }) {
     <div className="row-actions">
       <button className="icon-btn" title="Download DP.zip" disabled={user.revoked} onClick={() => downloadProfile(user.cert_profile_id, session)}><Download size={15} /></button>
       {!compact && <button className="icon-btn" title="Copy URL" disabled={user.revoked} onClick={() => copyText(url, setStatus)}><Copy size={15} /></button>}
+      {!compact && <button className="icon-btn" title="Copy plugin token" disabled={user.revoked || !user.plugin_api_token} onClick={() => copyText(user.plugin_api_token, setStatus)}><KeyRound size={15} /></button>}
       {!compact && <button className="icon-btn" title="QR" disabled={user.revoked} onClick={() => showQr(user.id, session, setStatus)}><QrCode size={15} /></button>}
       {!compact && <button className="icon-btn" title="Edit" disabled={user.revoked} onClick={() => editUser(user, session, load, setStatus)}><Pencil size={15} /></button>}
       {!compact && <button className="icon-btn" title="Reset password" disabled={user.revoked} onClick={() => resetUser(user, session, load, setStatus)}><KeyRound size={15} /></button>}
@@ -1880,75 +2169,6 @@ function UserActions({ user, url, session, load, setStatus, compact }) {
       <button className="icon-btn" title="Reissue" onClick={() => reissueUser(user, session, load, setStatus)}><PackagePlus size={15} /></button>
       <button className="icon-btn danger" title="Revoke" disabled={user.revoked} onClick={() => revokeUser(user, session, load, setStatus)}><XCircle size={15} /></button>
       <button className="icon-btn danger" title="Delete" onClick={() => deleteUser(user, session, load, setStatus)}><Trash2 size={15} /></button>
-    </div>
-  );
-}
-
-function ProfilesPanel({ profiles, certPassword, session, load, setStatus }) {
-  return (
-    <Panel title="Connection Packages" icon={Boxes} wide actions={<span className="hint">Certificate password: <code>{certPassword}</code></span>}>
-      <CreateProfile session={session} load={load} setStatus={setStatus} />
-      <ProfilesTable profiles={profiles} session={session} load={load} setStatus={setStatus} />
-    </Panel>
-  );
-}
-
-function CreateProfile({ session, load, setStatus }) {
-  const [form, setForm] = useState({ name: '', description: '' });
-  const submit = async (event) => {
-    event.preventDefault();
-    await api('/api/cert-profiles/create', session, { method: 'POST', body: JSON.stringify(form) });
-    setStatus('Connection package created.');
-    setForm({ name: '', description: '' });
-    await load();
-  };
-  return (
-    <form className="create-grid compact" onSubmit={submit}>
-      <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="alpha-phone" /></label>
-      <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
-      <button className="btn primary" type="submit"><PackagePlus size={16} />Create DP.zip</button>
-    </form>
-  );
-}
-
-function ProfilesTable({ profiles, session, load, setStatus }) {
-  if (!profiles.length) return <Empty title="No connection packages" detail="Create or reissue packages for ATAK/WinTAK TLS connections." />;
-  return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Name</th>
-            <th>Status</th>
-            <th>Connection / URL</th>
-            <th>Description</th>
-            <th>Created</th>
-            <th>Action</th>
-          </tr>
-        </thead>
-        <tbody>
-          {profiles.map((profile) => {
-            const url = `${location.origin}${profile.public_download_path || ''}`;
-            return (
-              <tr key={profile.id}>
-                <td><strong>{profile.name}</strong></td>
-                <td><Badge tone={profile.revoked ? 'bad' : 'good'}>{profile.revoked ? 'revoked' : 'active'}</Badge></td>
-                <td><code>{profile.connect_string}</code><br /><code>{url}</code></td>
-                <td>{profile.description || '-'}</td>
-                <td>{fmtTime(profile.created_at)}</td>
-                <td>
-                  <div className="row-actions">
-                    <button className="icon-btn" title="Download" disabled={profile.revoked} onClick={() => downloadProfile(profile.id, session)}><Download size={15} /></button>
-                    <button className="icon-btn" title="Copy URL" disabled={profile.revoked} onClick={() => copyText(url, setStatus)}><Copy size={15} /></button>
-                    <button className="icon-btn danger" title="Revoke" disabled={profile.revoked} onClick={() => revokeProfile(profile, session, load, setStatus)}><XCircle size={15} /></button>
-                    <button className="icon-btn danger" title="Delete" onClick={() => deleteProfile(profile, session, load, setStatus)}><Trash2 size={15} /></button>
-                  </div>
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
     </div>
   );
 }
@@ -1993,7 +2213,11 @@ async function editUser(user, session, load, setStatus) {
   if (displayName === null) return;
   const description = prompt(`Description for ${user.username}`, user.description || '');
   if (description === null) return;
-  await api('/api/portal-users/edit', session, { method: 'POST', body: JSON.stringify({ id: user.id, display_name: displayName, description }) });
+  const assignedIp = prompt(`Assigned IP override for ${user.username}. Leave blank to let TAKlite learn it.`, user.assigned_ip || '');
+  if (assignedIp === null) return;
+  const deviceMac = prompt(`Device ID override for ${user.username}. Leave blank to let TAKlite learn it.`, user.device_mac || '');
+  if (deviceMac === null) return;
+  await api('/api/portal-users/edit', session, { method: 'POST', body: JSON.stringify({ id: user.id, display_name: displayName, description, assigned_ip: assignedIp, device_mac: deviceMac }) });
   setStatus('User updated.');
   await load();
 }
@@ -2023,20 +2247,6 @@ async function deleteUser(user, session, load, setStatus) {
   const deleteProfile = confirm('Delete generated DP.zip/certificate package files too?');
   await api('/api/portal-users/delete', session, { method: 'POST', body: JSON.stringify({ id: user.id, delete_profile: deleteProfile }) });
   setStatus('User deleted.');
-  await load();
-}
-
-async function revokeProfile(profile, session, load, setStatus) {
-  if (!confirm(`Revoke connection package ${profile.name}?`)) return;
-  await api('/api/cert-profiles/revoke', session, { method: 'POST', body: JSON.stringify({ id: profile.id }) });
-  setStatus('Package revoked.');
-  await load();
-}
-
-async function deleteProfile(profile, session, load, setStatus) {
-  if (!confirm(`Delete connection package ${profile.name} and generated files?`)) return;
-  await api('/api/cert-profiles/delete', session, { method: 'POST', body: JSON.stringify({ id: profile.id, delete_files: true }) });
-  setStatus('Package deleted.');
   await load();
 }
 

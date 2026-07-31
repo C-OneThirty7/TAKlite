@@ -3,6 +3,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import io
 import json
 import os
@@ -51,7 +52,7 @@ DB_PATH = Path(os.environ.get("TAKLITE_DB", "/data/taklite.sqlite3"))
 PACKAGE_DIR = Path(os.environ.get("TAKLITE_PACKAGE_DIR", "/packages"))
 STATIC_DIR = Path(os.environ.get("TAKLITE_STATIC_DIR", "/app/static"))
 WG_DASHBOARD_URL = os.environ.get("TAKLITE_WGDASHBOARD_URL", "")
-VERSION = "TAKlite 0.2.22"
+VERSION = "TAKlite 0.2.23"
 STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 PORTAL_SESSION_HOURS = 2
 MAX_UPLOAD_BYTES = int(os.environ.get("TAKLITE_MAX_UPLOAD_BYTES", str(256 * 1024 * 1024)))
@@ -104,10 +105,15 @@ LOGIN_FAILURES = {}
 LOGIN_LOCK = threading.Lock()
 BULK_PASSWORD_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
 BULK_PORTAL_PASSWORD = "atakatak"
+ACCESS_LEVEL_UNCHANGED = object()
 
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def new_plugin_token():
+    return f"tlp_{secrets.token_urlsafe(32)}"
 
 
 def version_tuple(value):
@@ -209,8 +215,11 @@ def init_db():
                 id integer primary key autoincrement,
                 username text not null unique,
                 password_hash text not null,
+                plugin_api_token text unique,
                 display_name text,
                 description text,
+                assigned_ip text,
+                device_mac text,
                 cert_profile_id integer not null,
                 allow_redownload integer not null default 0,
                 first_download_at text,
@@ -228,8 +237,10 @@ def init_db():
                 description text,
                 can_see_all integer not null default 0,
                 can_send_all integer not null default 0,
+                can_receive_all integer not null default 0,
                 can_see_own_groups integer not null default 1,
                 can_send_own_groups integer not null default 1,
+                can_receive_own_groups integer not null default 1,
                 created_at text not null
             )
         """)
@@ -257,6 +268,7 @@ def init_db():
                 target_group_id integer not null,
                 can_see integer not null default 0,
                 can_send integer not null default 0,
+                can_receive integer not null default 0,
                 primary key(source_group_id, target_group_id),
                 foreign key(source_group_id) references access_groups(id) on delete cascade,
                 foreign key(target_group_id) references access_groups(id) on delete cascade
@@ -271,6 +283,46 @@ def init_db():
                 foreign key(user_id) references portal_users(id)
             )
         """)
+        conn.execute("""
+            create table if not exists datapackage_deliveries (
+                id integer primary key autoincrement,
+                package_hash text not null,
+                target_user_id integer,
+                target_uid text,
+                target_callsign text,
+                status text not null,
+                reason_code text not null,
+                reason text not null,
+                attempts integer not null default 0,
+                created_at text not null,
+                updated_at text not null,
+                delivered_at text,
+                foreign key(target_user_id) references portal_users(id) on delete set null
+            )
+        """)
+        conn.execute("""
+            create table if not exists datapackage_recipients (
+                package_hash text not null,
+                target_user_id integer not null,
+                created_at text not null,
+                primary key(package_hash, target_user_id),
+                foreign key(target_user_id) references portal_users(id) on delete cascade
+            )
+        """)
+        conn.execute("""
+            create table if not exists audit_events (
+                id integer primary key autoincrement,
+                occurred_at text not null,
+                event_type text not null,
+                actor_type text,
+                actor_id integer,
+                actor_name text,
+                remote text,
+                outcome text not null,
+                reason_code text,
+                details text
+            )
+        """)
         columns = {row["name"] for row in conn.execute("pragma table_info(cert_profiles)").fetchall()}
         if "download_token" not in columns:
             conn.execute("alter table cert_profiles add column download_token text")
@@ -279,6 +331,16 @@ def init_db():
         portal_columns = {row["name"] for row in conn.execute("pragma table_info(portal_users)").fetchall()}
         if "role_id" not in portal_columns:
             conn.execute("alter table portal_users add column role_id integer")
+        if "access_level" not in portal_columns:
+            conn.execute("alter table portal_users add column access_level integer")
+        if "plugin_api_token" not in portal_columns:
+            conn.execute("alter table portal_users add column plugin_api_token text")
+        if "assigned_ip" not in portal_columns:
+            conn.execute("alter table portal_users add column assigned_ip text")
+        if "device_mac" not in portal_columns:
+            conn.execute("alter table portal_users add column device_mac text")
+        for row in conn.execute("select id from portal_users where plugin_api_token is null or plugin_api_token = ''").fetchall():
+            conn.execute("update portal_users set plugin_api_token = ? where id = ?", (new_plugin_token(), row["id"]))
         admin_columns = {row["name"] for row in conn.execute("pragma table_info(admins)").fetchall()}
         if "totp_secret" not in admin_columns:
             conn.execute("alter table admins add column totp_secret text")
@@ -289,12 +351,34 @@ def init_db():
             conn.execute("alter table datapackages add column CreatorUserId integer")
         if "Visibility" not in package_columns:
             conn.execute("alter table datapackages add column Visibility text not null default 'private'")
+        if "PolicyMode" not in package_columns:
+            conn.execute("alter table datapackages add column PolicyMode text not null default 'sender'")
+        if "AllowedLevels" not in package_columns:
+            conn.execute("alter table datapackages add column AllowedLevels text not null default ''")
+        role_columns = {row["name"] for row in conn.execute("pragma table_info(access_roles)").fetchall()}
+        if "can_receive_all" not in role_columns:
+            conn.execute("alter table access_roles add column can_receive_all integer not null default 0")
+            conn.execute("update access_roles set can_receive_all = can_send_all")
+        if "can_receive_own_groups" not in role_columns:
+            conn.execute("alter table access_roles add column can_receive_own_groups integer not null default 1")
+            conn.execute("update access_roles set can_receive_own_groups = can_send_own_groups")
+        link_columns = {row["name"] for row in conn.execute("pragma table_info(access_policy_links)").fetchall()}
+        if "can_receive" not in link_columns:
+            conn.execute("alter table access_policy_links add column can_receive integer not null default 0")
+            conn.execute("update access_policy_links set can_receive = can_send")
         conn.execute("create index if not exists idx_events_uid on events(uid)")
         conn.execute("create index if not exists idx_events_received_at on events(received_at)")
         conn.execute("create index if not exists idx_datapackages_hash on datapackages(Hash)")
+        conn.execute("create index if not exists idx_datapackage_deliveries_hash on datapackage_deliveries(package_hash)")
+        conn.execute("create index if not exists idx_datapackage_deliveries_pending on datapackage_deliveries(target_user_id, status)")
+        conn.execute("create index if not exists idx_datapackage_recipients_user on datapackage_recipients(target_user_id)")
         conn.execute("create index if not exists idx_portal_users_profile on portal_users(cert_profile_id)")
+        conn.execute("create index if not exists idx_portal_users_assigned_ip on portal_users(assigned_ip)")
+        conn.execute("create index if not exists idx_portal_users_device_mac on portal_users(device_mac)")
         conn.execute("create index if not exists idx_access_user_groups_user on access_user_groups(user_id)")
         conn.execute("create index if not exists idx_access_user_groups_group on access_user_groups(group_id)")
+        conn.execute("create index if not exists idx_audit_events_time on audit_events(occurred_at)")
+        conn.execute("create index if not exists idx_audit_events_type on audit_events(event_type)")
         conn.commit()
 
 
@@ -310,11 +394,146 @@ def safe_download_name(filename, fallback="download.bin"):
     return name[:160] or fallback
 
 
+def record_audit_event(event_type, actor_type="", actor_id=None, actor_name="", remote="", outcome="ok", reason_code="", details=None):
+    details = details or {}
+    try:
+        details_json = json.dumps(details, sort_keys=True)[:4096]
+        with db_connect() as conn:
+            conn.execute("""
+                insert into audit_events
+                  (occurred_at, event_type, actor_type, actor_id, actor_name, remote, outcome, reason_code, details)
+                values (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                utc_now(),
+                (event_type or "event").strip()[:80],
+                (actor_type or "").strip()[:40],
+                actor_id,
+                (actor_name or "").strip()[:120],
+                (remote or "").strip()[:120],
+                (outcome or "ok").strip()[:40],
+                (reason_code or "").strip()[:80],
+                details_json,
+            ))
+            conn.commit()
+    except Exception as exc:
+        print(f"TAKlite audit record failed: {exc}", flush=True)
+
+
+def audit_row(row):
+    details = {}
+    try:
+        details = json.loads(row["details"] or "{}")
+    except Exception:
+        details = {}
+    return {
+        "id": row["id"],
+        "occurred_at": row["occurred_at"],
+        "event_type": row["event_type"],
+        "actor_type": row["actor_type"] or "",
+        "actor_id": row["actor_id"],
+        "actor_name": row["actor_name"] or "",
+        "remote": row["remote"] or "",
+        "outcome": row["outcome"],
+        "reason_code": row["reason_code"] or "",
+        "details": details,
+    }
+
+
+def list_audit_events(limit=100, event_type=""):
+    try:
+        limit = int(limit or 100)
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, 500))
+    params = []
+    where = ""
+    if event_type:
+        where = "where event_type = ?"
+        params.append(event_type.strip())
+    params.append(limit)
+    with db_connect() as conn:
+        rows = conn.execute(f"""
+            select *
+            from audit_events
+            {where}
+            order by id desc
+            limit ?
+        """, params).fetchall()
+    return [audit_row(row) for row in rows]
+
+
 def normalize_datapackage_name(filename, fallback="datapackage.zip"):
     name = safe_download_name(unquote(filename or ""), fallback)
     if not name.lower().endswith((".zip", ".dp.zip")):
         name = f"{name}.zip"
     return name
+
+
+def validate_access_level(value, allow_empty=True):
+    if value in (None, "") and allow_empty:
+        return None
+    try:
+        level = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("access level must be 1, 2, 3, 4, or blank") from exc
+    if level < 1 or level > 4:
+        raise ValueError("access level must be 1, 2, 3, 4, or blank")
+    return level
+
+
+def parse_datapackage_filename_policy(filename):
+    base = Path(filename or "").name
+    lowered = base.lower()
+    for suffix in (".dp.zip", ".zip"):
+        if lowered.endswith(suffix):
+            lowered = lowered[:-len(suffix)]
+            break
+    compact = re.sub(r"[^a-z0-9]", "", lowered)
+    mode = ""
+    if compact.endswith("only"):
+        mode = "only"
+        source = compact[:-4]
+    elif compact.endswith("all"):
+        mode = "all"
+        source = compact[:-3]
+    else:
+        return {"mode": "sender", "allowed_levels": [], "label": "Sender policy"}
+    if "lvl" not in source:
+        return {"mode": "sender", "allowed_levels": [], "label": "Sender policy"}
+    level_source = source[source.find("lvl"):]
+    levels = sorted({int(value) for value in re.findall(r"(?:lvl)?([1-4])", level_source)})
+    if not levels:
+        return {"mode": "sender", "allowed_levels": [], "label": "Sender policy"}
+    if mode == "all":
+        levels = list(range(1, max(levels) + 1))
+        label = f"Levels {', '.join(str(level) for level in levels)}"
+    else:
+        label = f"Level{'s' if len(levels) > 1 else ''} {', '.join(str(level) for level in levels)} only"
+    return {"mode": f"level_{mode}", "allowed_levels": levels, "label": label}
+
+
+def serialize_levels(levels):
+    return ",".join(str(validate_access_level(level, allow_empty=False)) for level in sorted({int(level) for level in levels or []}))
+
+
+def deserialize_levels(value):
+    levels = []
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        levels.append(validate_access_level(part, allow_empty=False))
+    return sorted(set(levels))
+
+
+def parse_datapackage_policy_label(mode, allowed_levels):
+    levels = deserialize_levels(allowed_levels)
+    mode = (mode or "sender").lower()
+    if not mode.startswith("level_") or not levels:
+        return "Sender policy"
+    if mode == "level_only":
+        return f"Level{'s' if len(levels) > 1 else ''} {', '.join(str(level) for level in levels)} only"
+    return f"Levels {', '.join(str(level) for level in levels)}"
 
 
 def marti_timestamp(value):
@@ -343,6 +562,12 @@ def row_to_package(row):
         "Tool": row["Tool"] or "public",
         "CreatorUserId": row["CreatorUserId"] if "CreatorUserId" in row.keys() else None,
         "Visibility": row["Visibility"] if "Visibility" in row.keys() else "private",
+        "PolicyMode": row["PolicyMode"] if "PolicyMode" in row.keys() else "sender",
+        "AllowedLevels": deserialize_levels(row["AllowedLevels"]) if "AllowedLevels" in row.keys() else [],
+        "PolicyLabel": parse_datapackage_policy_label(
+            row["PolicyMode"] if "PolicyMode" in row.keys() else "sender",
+            row["AllowedLevels"] if "AllowedLevels" in row.keys() else "",
+        ),
     }
 
 
@@ -366,10 +591,13 @@ def find_package(hash_value):
         ).fetchone()
 
 
-def upsert_package(hash_value, filename, creator_uid, data, host_url, creator_user_id=None, visibility="private"):
+def upsert_package(hash_value, filename, creator_uid, data, host_url, creator_user_id=None, visibility="private", policy=None):
     actual_hash = hashlib.sha256(data).hexdigest()
     hash_value = hash_value or actual_hash
     filename = filename or f"{hash_value}.dp.zip"
+    policy = policy or parse_datapackage_filename_policy(filename)
+    policy_mode = policy.get("mode") or "sender"
+    allowed_levels = serialize_levels(policy.get("allowed_levels", []))
     path = package_path(hash_value, filename)
     path.write_bytes(data)
     now = utc_now()
@@ -382,8 +610,8 @@ def upsert_package(hash_value, filename, creator_uid, data, host_url, creator_us
             uid = existing["UID"]
         conn.execute("""
             insert into datapackages
-                (UID, Name, Hash, SubmissionDateTime, SubmissionUser, CreatorUid, Keywords, MIMEType, Size, Path, Tool, CreatorUserId, Visibility)
-            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce((select Tool from datapackages where Hash = ?), ?), ?, ?)
+                (UID, Name, Hash, SubmissionDateTime, SubmissionUser, CreatorUid, Keywords, MIMEType, Size, Path, Tool, CreatorUserId, Visibility, PolicyMode, AllowedLevels)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, coalesce((select Tool from datapackages where Hash = ?), ?), ?, ?, ?, ?)
             on conflict(Hash) do update set
                 Name=excluded.Name,
                 SubmissionDateTime=excluded.SubmissionDateTime,
@@ -393,10 +621,12 @@ def upsert_package(hash_value, filename, creator_uid, data, host_url, creator_us
                 Size=excluded.Size,
                 Path=excluded.Path,
                 CreatorUserId=coalesce(excluded.CreatorUserId, CreatorUserId),
-                Visibility=excluded.Visibility
+                Visibility=excluded.Visibility,
+                PolicyMode=excluded.PolicyMode,
+                AllowedLevels=excluded.AllowedLevels
         """, (
             uid, filename, hash_value, now, creator_uid or "", creator_uid or "",
-            "missionpackage", "application/x-zip-compressed", len(data), str(path), hash_value, visibility or "private", creator_user_id, visibility or "private",
+            "missionpackage", "application/x-zip-compressed", len(data), str(path), hash_value, visibility or "private", creator_user_id, visibility or "private", policy_mode, allowed_levels,
         ))
         conn.commit()
     return f"{host_url}/Marti/sync/content?hash={quote(hash_value)}"
@@ -462,7 +692,7 @@ def save_event(data, remote, user_id=None):
         prune_events_if_needed(conn)
         conn.commit()
     if uid or callsign:
-        RELAY.update_client(remote, uid, callsign)
+        RELAY.update_client(remote, uid, callsign, user_id=user_id)
     if uid:
         RELAY.remember_event(uid, data, user_id)
 
@@ -748,6 +978,28 @@ def validate_portal_username(username):
     return username
 
 
+def validate_assigned_ip(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        return str(ipaddress.ip_address(value))
+    except ValueError as exc:
+        raise ValueError("assigned IP must be a valid IPv4 or IPv6 address") from exc
+
+
+def validate_device_mac(value):
+    value = (value or "").strip()
+    if not value:
+        return ""
+    compact = re.sub(r"[^0-9A-Fa-f]", "", value)
+    if len(compact) == 12 and re.fullmatch(r"[0-9A-Fa-f]{12}", compact):
+        return ":".join(compact[idx:idx + 2] for idx in range(0, 12, 2)).lower()
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]{3,128}", value):
+        raise ValueError("device ID must be 3-128 characters: letters, numbers, dot, underscore, dash, colon, or @")
+    return value
+
+
 def validate_access_name(name, label="name"):
     name = (name or "").strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@() -]{0,63}", name):
@@ -762,8 +1014,10 @@ def row_to_role(row):
         "description": row["description"] or "",
         "can_see_all": bool(row["can_see_all"]),
         "can_send_all": bool(row["can_send_all"]),
+        "can_receive_all": bool(row["can_receive_all"]),
         "can_see_own_groups": bool(row["can_see_own_groups"]),
         "can_send_own_groups": bool(row["can_send_own_groups"]),
+        "can_receive_own_groups": bool(row["can_receive_own_groups"]),
         "created_at": row["created_at"],
     }
 
@@ -784,23 +1038,30 @@ def row_to_policy_link(row):
         "target_group_id": row["target_group_id"],
         "can_see": bool(row["can_see"]),
         "can_send": bool(row["can_send"]),
+        "can_receive": bool(row["can_receive"]),
     }
 
 
-def create_access_role(name, description="", can_see_all=False, can_send_all=False, can_see_own_groups=True, can_send_own_groups=True):
+def create_access_role(name, description="", can_see_all=False, can_send_all=False, can_see_own_groups=True, can_send_own_groups=True, can_receive_all=None, can_receive_own_groups=None):
     name = validate_access_name(name, "role name")
+    if can_receive_all is None:
+        can_receive_all = can_send_all
+    if can_receive_own_groups is None:
+        can_receive_own_groups = can_send_own_groups
     with db_connect() as conn:
         conn.execute("""
             insert into access_roles
-              (name, description, can_see_all, can_send_all, can_see_own_groups, can_send_own_groups, created_at)
-            values (?, ?, ?, ?, ?, ?, ?)
+              (name, description, can_see_all, can_send_all, can_receive_all, can_see_own_groups, can_send_own_groups, can_receive_own_groups, created_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             name,
             (description or "").strip(),
             1 if can_see_all else 0,
             1 if can_send_all else 0,
+            1 if can_receive_all else 0,
             1 if can_see_own_groups else 0,
             1 if can_send_own_groups else 0,
+            1 if can_receive_own_groups else 0,
             utc_now(),
         ))
         conn.commit()
@@ -808,20 +1069,26 @@ def create_access_role(name, description="", can_see_all=False, can_send_all=Fal
     return row_to_role(row)
 
 
-def update_access_role(role_id, name, description="", can_see_all=False, can_send_all=False, can_see_own_groups=True, can_send_own_groups=True):
+def update_access_role(role_id, name, description="", can_see_all=False, can_send_all=False, can_see_own_groups=True, can_send_own_groups=True, can_receive_all=None, can_receive_own_groups=None):
     name = validate_access_name(name, "role name")
+    if can_receive_all is None:
+        can_receive_all = can_send_all
+    if can_receive_own_groups is None:
+        can_receive_own_groups = can_send_own_groups
     with db_connect() as conn:
         conn.execute("""
             update access_roles
-            set name = ?, description = ?, can_see_all = ?, can_send_all = ?, can_see_own_groups = ?, can_send_own_groups = ?
+            set name = ?, description = ?, can_see_all = ?, can_send_all = ?, can_receive_all = ?, can_see_own_groups = ?, can_send_own_groups = ?, can_receive_own_groups = ?
             where id = ?
         """, (
             name,
             (description or "").strip(),
             1 if can_see_all else 0,
             1 if can_send_all else 0,
+            1 if can_receive_all else 0,
             1 if can_see_own_groups else 0,
             1 if can_send_own_groups else 0,
+            1 if can_receive_own_groups else 0,
             role_id,
         ))
         conn.commit()
@@ -895,9 +1162,11 @@ def list_policy_links():
     return [row_to_policy_link(row) for row in rows]
 
 
-def set_user_access(user_id, role_id=None, group_ids=None):
+def set_user_access(user_id, role_id=None, group_ids=None, access_level=ACCESS_LEVEL_UNCHANGED):
     group_ids = [int(value) for value in (group_ids or []) if str(value).strip()]
     role_id = int(role_id or 0) or None
+    if access_level is not ACCESS_LEVEL_UNCHANGED:
+        access_level = validate_access_level(access_level)
     with db_connect() as conn:
         if role_id and not conn.execute("select id from access_roles where id = ?", (role_id,)).fetchone():
             raise ValueError("role not found")
@@ -909,14 +1178,17 @@ def set_user_access(user_id, role_id=None, group_ids=None):
                 raise ValueError(f"group not found: {missing[0]}")
         if not conn.execute("select id from portal_users where id = ?", (user_id,)).fetchone():
             raise ValueError("user not found")
-        conn.execute("update portal_users set role_id = ? where id = ?", (role_id, user_id))
+        if access_level is ACCESS_LEVEL_UNCHANGED:
+            conn.execute("update portal_users set role_id = ? where id = ?", (role_id, user_id))
+        else:
+            conn.execute("update portal_users set role_id = ?, access_level = ? where id = ?", (role_id, access_level, user_id))
         conn.execute("delete from access_user_groups where user_id = ?", (user_id,))
         conn.executemany("insert into access_user_groups (user_id, group_id) values (?, ?)", [(user_id, gid) for gid in group_ids])
         conn.commit()
     return attach_access_to_users([portal_user_row(find_portal_user(user_id))])[0]
 
 
-def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="replace"):
+def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="replace", access_level=None, level_mode="unchanged"):
     user_ids = sorted({int(value) for value in (user_ids or []) if str(value).strip()})
     if not user_ids:
         raise ValueError("select at least one user")
@@ -925,6 +1197,10 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
     if group_mode not in ("replace", "add", "remove"):
         raise ValueError("group mode must be replace, add, or remove")
     role_id = int(role_id or 0) or None
+    level_mode = (level_mode or "unchanged").strip().lower()
+    if level_mode not in ("unchanged", "set", "clear"):
+        raise ValueError("level mode must be unchanged, set, or clear")
+    access_level = validate_access_level(access_level, allow_empty=(level_mode != "set"))
     with db_connect() as conn:
         placeholders = ",".join("?" for _ in user_ids)
         found_users = {row["id"] for row in conn.execute(f"select id from portal_users where id in ({placeholders})", user_ids).fetchall()}
@@ -941,6 +1217,10 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
                 raise ValueError(f"group not found: {missing_groups[0]}")
         if role_id is not None:
             conn.executemany("update portal_users set role_id = ? where id = ?", [(role_id, user_id) for user_id in user_ids])
+        if level_mode == "set":
+            conn.executemany("update portal_users set access_level = ? where id = ?", [(access_level, user_id) for user_id in user_ids])
+        elif level_mode == "clear":
+            conn.executemany("update portal_users set access_level = null where id = ?", [(user_id,) for user_id in user_ids])
         if group_mode == "replace":
             conn.executemany("delete from access_user_groups where user_id = ?", [(user_id,) for user_id in user_ids])
             conn.executemany(
@@ -961,26 +1241,29 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
     return {"ok": True, "updated": len(user_ids)}
 
 
-def set_policy_link(source_group_id, target_group_id, can_see=False, can_send=False):
+def set_policy_link(source_group_id, target_group_id, can_see=False, can_send=False, can_receive=None):
     source_group_id = int(source_group_id)
     target_group_id = int(target_group_id)
+    if can_receive is None:
+        can_receive = can_send
     with db_connect() as conn:
         for gid in (source_group_id, target_group_id):
             if not conn.execute("select id from access_groups where id = ?", (gid,)).fetchone():
                 raise ValueError("group not found")
-        if can_see or can_send:
+        if can_see or can_send or can_receive:
             conn.execute("""
-                insert into access_policy_links (source_group_id, target_group_id, can_see, can_send)
-                values (?, ?, ?, ?)
+                insert into access_policy_links (source_group_id, target_group_id, can_see, can_send, can_receive)
+                values (?, ?, ?, ?, ?)
                 on conflict(source_group_id, target_group_id) do update set
                     can_see = excluded.can_see,
-                    can_send = excluded.can_send
-            """, (source_group_id, target_group_id, 1 if can_see else 0, 1 if can_send else 0))
+                    can_send = excluded.can_send,
+                    can_receive = excluded.can_receive
+            """, (source_group_id, target_group_id, 1 if can_see else 0, 1 if can_send else 0, 1 if can_receive else 0))
         else:
             conn.execute("delete from access_policy_links where source_group_id = ? and target_group_id = ?", (source_group_id, target_group_id))
         conn.commit()
         row = conn.execute("select * from access_policy_links where source_group_id = ? and target_group_id = ?", (source_group_id, target_group_id)).fetchone()
-    return row_to_policy_link(row) if row else {"source_group_id": source_group_id, "target_group_id": target_group_id, "can_see": False, "can_send": False}
+    return row_to_policy_link(row) if row else {"source_group_id": source_group_id, "target_group_id": target_group_id, "can_see": False, "can_send": False, "can_receive": False}
 
 
 def access_policy_active():
@@ -997,7 +1280,9 @@ def access_policy_active():
 def subject_policy(user_id):
     with db_connect() as conn:
         row = conn.execute("""
-            select u.id, u.username, r.can_see_all, r.can_send_all, r.can_see_own_groups, r.can_send_own_groups
+            select u.id, u.username, u.access_level,
+                   r.can_see_all, r.can_send_all, r.can_receive_all,
+                   r.can_see_own_groups, r.can_send_own_groups, r.can_receive_own_groups
             from portal_users u
             left join access_roles r on r.id = u.role_id
             where u.id = ? and u.revoked_at is null
@@ -1008,10 +1293,13 @@ def subject_policy(user_id):
     return {
         "id": row["id"],
         "username": row["username"],
+        "access_level": row["access_level"] if "access_level" in row.keys() else None,
         "can_see_all": bool(row["can_see_all"]),
         "can_send_all": bool(row["can_send_all"]),
+        "can_receive_all": bool(row["can_receive_all"]),
         "can_see_own_groups": bool(row["can_see_own_groups"]),
         "can_send_own_groups": bool(row["can_send_own_groups"]),
+        "can_receive_own_groups": bool(row["can_receive_own_groups"]),
         "groups": groups,
     }
 
@@ -1027,15 +1315,25 @@ def can_subject_action(viewer_id, target_id, action):
         return True
     if viewer[f"can_{action}_all"]:
         return True
+    def level_allowed():
+        if action == "receive":
+            return True
+        viewer_level = viewer.get("access_level")
+        target_level = target.get("access_level")
+        if viewer_level is None or target_level is None:
+            return True
+        return int(viewer_level) >= int(target_level)
     if viewer[f"can_{action}_own_groups"] and viewer["groups"] & target["groups"]:
-        return True
+        return level_allowed()
     if not viewer["groups"] or not target["groups"]:
         return False
     column = f"can_{action}"
     with db_connect() as conn:
-        source_placeholders = ",".join("?" for _ in viewer["groups"])
-        target_placeholders = ",".join("?" for _ in target["groups"])
-        params = list(viewer["groups"]) + list(target["groups"])
+        source_groups = target["groups"] if action == "receive" else viewer["groups"]
+        target_groups = viewer["groups"] if action == "receive" else target["groups"]
+        source_placeholders = ",".join("?" for _ in source_groups)
+        target_placeholders = ",".join("?" for _ in target_groups)
+        params = list(source_groups) + list(target_groups)
         row = conn.execute(f"""
             select 1
             from access_policy_links
@@ -1044,7 +1342,7 @@ def can_subject_action(viewer_id, target_id, action):
               and {column} = 1
             limit 1
         """, params).fetchone()
-    return bool(row)
+    return bool(row) and level_allowed()
 
 
 def can_subject_see(viewer_id, target_id):
@@ -1053,6 +1351,14 @@ def can_subject_see(viewer_id, target_id):
 
 def can_subject_send(viewer_id, target_id):
     return can_subject_action(viewer_id, target_id, "send")
+
+
+def can_subject_receive(recipient_id, sender_id):
+    return can_subject_action(recipient_id, sender_id, "receive")
+
+
+def can_send_datapackage(sender_id, recipient_id):
+    return can_subject_send(sender_id, recipient_id) and can_subject_receive(recipient_id, sender_id)
 
 
 def access_summary():
@@ -1072,15 +1378,17 @@ def access_preview(user_id):
     if not subject:
         raise ValueError("user not found")
 
-    def preview_user(user, can_see=False, can_send=False):
+    def preview_user(user, can_see=False, can_send=False, can_receive=False):
         return {
             "id": user["id"],
             "username": user["username"],
             "display_name": user.get("display_name", ""),
             "role_name": user.get("role_name", ""),
+            "access_level": user.get("access_level"),
             "groups": user.get("groups", []),
             "can_see": can_see,
             "can_send": can_send,
+            "can_receive": can_receive,
         }
 
     can_see = []
@@ -1089,13 +1397,13 @@ def access_preview(user_id):
     senders = []
     for target in users:
         if can_subject_see(user_id, target["id"]):
-            can_see.append(preview_user(target, can_see=True, can_send=can_subject_send(user_id, target["id"])))
-        if can_subject_send(user_id, target["id"]):
-            can_send.append(preview_user(target, can_see=can_subject_see(user_id, target["id"]), can_send=True))
+            can_see.append(preview_user(target, can_see=True, can_send=can_send_datapackage(user_id, target["id"]), can_receive=can_send_datapackage(target["id"], user_id)))
+        if can_send_datapackage(user_id, target["id"]):
+            can_send.append(preview_user(target, can_see=can_subject_see(user_id, target["id"]), can_send=True, can_receive=can_subject_receive(target["id"], user_id)))
         if can_subject_see(target["id"], user_id):
-            seen_by.append(preview_user(target, can_see=True, can_send=can_subject_send(target["id"], user_id)))
-        if can_subject_send(target["id"], user_id):
-            senders.append(preview_user(target, can_see=can_subject_see(target["id"], user_id), can_send=True))
+            seen_by.append(preview_user(target, can_see=True, can_send=can_send_datapackage(target["id"], user_id), can_receive=can_send_datapackage(user_id, target["id"])))
+        if can_send_datapackage(target["id"], user_id):
+            senders.append(preview_user(target, can_see=can_subject_see(target["id"], user_id), can_send=True, can_receive=can_subject_receive(user_id, target["id"])))
     return {
         "subject": preview_user(subject),
         "can_see": can_see,
@@ -1106,6 +1414,375 @@ def access_preview(user_id):
         "policy_active": access_policy_active(),
         "open_default": ACCESS_CONTROL_ENFORCE and not access_policy_active(),
     }
+
+
+def parse_int_list(value):
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = []
+        for item in value:
+            raw.extend(parse_int_list(item))
+        return raw
+    return [int(part) for part in re.split(r"[, ]+", str(value).strip()) if part]
+
+
+def find_portal_user_by_plugin_token(token):
+    token = (token or "").strip()
+    if not re.fullmatch(r"tlp_[A-Za-z0-9_-]{20,100}", token):
+        return None
+    with db_connect() as conn:
+        return conn.execute("""
+            select u.*, p.name as profile_name, p.connect_string, p.datapackage_file, p.revoked_at as profile_revoked_at
+            from portal_users u
+            left join cert_profiles p on p.id = u.cert_profile_id
+            where u.plugin_api_token = ?
+        """, (token,)).fetchone()
+
+
+def find_portal_user_by_device_binding(source_ip, device_mac=""):
+    source_ip = validate_assigned_ip(source_ip)
+    device_mac = validate_device_mac(device_mac)
+    with db_connect() as conn:
+        rows = conn.execute("""
+            select u.*, p.name as profile_name, p.connect_string, p.datapackage_file, p.revoked_at as profile_revoked_at
+            from portal_users u
+            left join cert_profiles p on p.id = u.cert_profile_id
+            where u.assigned_ip = ?
+              and u.revoked_at is null
+              and p.revoked_at is null
+        """, (source_ip,)).fetchall()
+    if not rows:
+        return None
+    if device_mac:
+        rows = [row for row in rows if (row["device_mac"] or "").lower() in ("", device_mac)]
+    elif any(row["device_mac"] for row in rows):
+        return None
+    return rows[0] if len(rows) == 1 else None
+
+
+def learn_portal_user_device(user_id, source_ip="", device_id=""):
+    source_ip = validate_assigned_ip(source_ip)
+    device_id = validate_device_mac(device_id)
+    if not user_id or (not source_ip and not device_id):
+        return False
+    assignments = []
+    params = []
+    if source_ip:
+        assignments.append("assigned_ip = coalesce(nullif(assigned_ip, ''), ?)")
+        params.append(source_ip)
+    if device_id:
+        assignments.append("device_mac = coalesce(nullif(device_mac, ''), ?)")
+        params.append(device_id)
+    if not assignments:
+        return False
+    params.append(int(user_id))
+    with db_connect() as conn:
+        row = conn.execute("select assigned_ip, device_mac from portal_users where id = ?", (int(user_id),)).fetchone()
+        if not row:
+            return False
+        conn.execute(f"update portal_users set {', '.join(assignments)} where id = ?", params)
+        conn.commit()
+        updated = conn.execute("select assigned_ip, device_mac from portal_users where id = ?", (int(user_id),)).fetchone()
+    return bool(updated and (updated["assigned_ip"] != row["assigned_ip"] or updated["device_mac"] != row["device_mac"]))
+
+
+def plugin_user_for_request(handler):
+    auth = handler.headers.get("Authorization", "")
+    token = handler.headers.get("X-TAKlite-Plugin-Token", "")
+    if not token and auth.lower().startswith("bearer "):
+        token = auth.split(None, 1)[1]
+    row = find_portal_user_by_plugin_token(token)
+    if row and not row["revoked_at"] and not row["profile_revoked_at"]:
+        return portal_user_row(row)
+    identity = client_identity_for_cert(handler.client_cert_common_name())
+    if identity:
+        found = find_portal_user(identity["user_id"])
+        if found:
+            return portal_user_row(found)
+    return None
+
+
+def group_id_set(user):
+    return {int(group_id) for group_id in user.get("group_ids", []) if str(group_id).strip()}
+
+
+def plugin_context_for_user(user):
+    user = attach_access_to_users([user])[0]
+    policy = subject_policy(user["id"]) or {}
+    users = [item for item in list_portal_users() if not item.get("revoked")]
+    groups = list_access_groups()
+    roles = list_access_roles()
+    return {
+        "ok": True,
+        "user": user,
+        "capabilities": {
+            "broad_access": bool(policy.get("can_see_all") or policy.get("can_send_all") or policy.get("can_receive_all")),
+            "can_see_all": bool(policy.get("can_see_all")),
+            "can_send_all": bool(policy.get("can_send_all")),
+            "can_receive_all": bool(policy.get("can_receive_all")),
+            "can_see_own_groups": bool(policy.get("can_see_own_groups")),
+            "can_send_own_groups": bool(policy.get("can_send_own_groups")),
+            "can_receive_own_groups": bool(policy.get("can_receive_own_groups")),
+        },
+        "access": {
+            "policy_active": access_policy_active(),
+            "enforced": ACCESS_CONTROL_ENFORCE,
+            "roles": roles,
+            "groups": groups,
+            "links": list_policy_links(),
+        },
+        "audience_modes": [
+            {
+                "id": "all_allowed",
+                "label": "Everyone I Am Allowed To Send To",
+                "description": "The server policy decides every allowed recipient.",
+            },
+            {
+                "id": "own_groups",
+                "label": "My Teams Only",
+                "description": "Send only to users who share at least one team with me.",
+            },
+            {
+                "id": "groups",
+                "label": "Chosen Teams",
+                "description": "Send only to members of the teams selected below.",
+            },
+            {
+                "id": "specific_users",
+                "label": "Chosen Users",
+                "description": "Send only to the users selected below.",
+            },
+        ],
+        "levels": [1, 2, 3, 4],
+        "users": [
+            {
+                "id": item["id"],
+                "username": item["username"],
+                "display_name": item.get("display_name", ""),
+                "role_name": item.get("role_name", ""),
+                "access_level": item.get("access_level"),
+                "groups": item.get("groups", []),
+                "can_send_package": can_send_datapackage(user["id"], item["id"]),
+                "can_receive_package": can_send_datapackage(item["id"], user["id"]),
+                "can_see_pli": can_subject_see(user["id"], item["id"]),
+                "seen_by": can_subject_see(item["id"], user["id"]),
+            }
+            for item in users
+        ],
+    }
+
+
+def plugin_audience_filter(sender, target, payload):
+    mode = (payload.get("audience_mode") or payload.get("mode") or "all_allowed").strip().lower()
+    include_self = bool(payload.get("include_self", False))
+    if int(sender["id"]) == int(target["id"]) and not include_self:
+        return False, "blocked_self", "Sender is excluded from this audience."
+    levels = set(parse_int_list(payload.get("levels", payload.get("allowed_levels", []))))
+    if levels:
+        target_level = target.get("access_level")
+        if target_level is None or int(target_level) not in levels:
+            return False, "blocked_level_filter", f"Target level is {target_level or 'not assigned'}."
+    if mode in ("all", "all_allowed", "linked", "linked_groups", "trusted", "trusted_groups"):
+        return True, "audience_match", "Target is inside the requested broad audience."
+    if mode in ("own", "own_group", "own_groups", "my_team", "my_teams"):
+        if group_id_set(sender) & group_id_set(target):
+            return True, "audience_match_own_group", "Target shares a team with sender."
+        return False, "blocked_audience_group", "Target does not share a team with sender."
+    if mode in ("group", "groups", "team", "teams"):
+        requested_groups = set(parse_int_list(payload.get("group_ids", payload.get("team_ids", []))))
+        if not requested_groups:
+            return False, "blocked_audience_missing_groups", "No target teams were selected."
+        if requested_groups & group_id_set(target):
+            return True, "audience_match_group", "Target is in a selected team."
+        return False, "blocked_audience_group", "Target is not in a selected team."
+    if mode in ("specific", "specific_users", "users", "contacts"):
+        requested_users = set(parse_int_list(payload.get("user_ids", payload.get("target_user_ids", []))))
+        if not requested_users:
+            return False, "blocked_audience_missing_users", "No target users were selected."
+        if int(target["id"]) in requested_users:
+            return True, "audience_match_user", "Target user was selected."
+        return False, "blocked_audience_user", "Target user was not selected."
+    return False, "blocked_audience_mode", f"Unsupported audience mode: {mode}."
+
+
+def plugin_datapackage_audience(sender_user_id, payload):
+    sender = portal_user_row(find_portal_user(sender_user_id))
+    sender = attach_access_to_users([sender])[0]
+    users = [user for user in list_portal_users() if not user.get("revoked")]
+    results = []
+    for target in users:
+        in_audience, audience_code, audience_reason = plugin_audience_filter(sender, target, payload)
+        if not in_audience:
+            results.append({
+                "user_id": target["id"],
+                "username": target["username"],
+                "display_name": target.get("display_name", ""),
+                "allowed": False,
+                "reason_code": audience_code,
+                "reason": audience_reason,
+            })
+            continue
+        if not can_subject_send(sender["id"], target["id"]):
+            results.append({
+                "user_id": target["id"],
+                "username": target["username"],
+                "display_name": target.get("display_name", ""),
+                "allowed": False,
+                "reason_code": "blocked_sender_policy",
+                "reason": "Sender is not allowed to send datapackages to this target.",
+            })
+            continue
+        if not can_subject_receive(target["id"], sender["id"]):
+            results.append({
+                "user_id": target["id"],
+                "username": target["username"],
+                "display_name": target.get("display_name", ""),
+                "allowed": False,
+                "reason_code": "blocked_receive_policy",
+                "reason": "Target is not allowed to receive datapackages from sender.",
+            })
+            continue
+        results.append({
+            "user_id": target["id"],
+            "username": target["username"],
+            "display_name": target.get("display_name", ""),
+            "allowed": True,
+            "reason_code": "allowed_plugin_policy",
+            "reason": "Target matched the requested audience and server policy allows delivery.",
+        })
+    return {
+        "sender": sender,
+        "audience": {
+            "mode": (payload.get("audience_mode") or payload.get("mode") or "all_allowed").strip().lower(),
+            "user_ids": parse_int_list(payload.get("user_ids", payload.get("target_user_ids", []))),
+            "group_ids": parse_int_list(payload.get("group_ids", payload.get("team_ids", []))),
+            "levels": parse_int_list(payload.get("levels", payload.get("allowed_levels", []))),
+            "include_self": bool(payload.get("include_self", False)),
+        },
+        "allowed_user_ids": [item["user_id"] for item in results if item["allowed"]],
+        "allowed_count": sum(1 for item in results if item["allowed"]),
+        "blocked_count": sum(1 for item in results if not item["allowed"]),
+        "items": results,
+    }
+
+
+def plugin_upload_datapackage(handler, qs):
+    user = handler.require_plugin_user()
+    if not user:
+        return None
+    payload = {
+        "audience_mode": qs.get("audience_mode", qs.get("mode", ["all_allowed"]))[0],
+        "user_ids": qs.get("user_ids", qs.get("target_user_ids", [""]))[0],
+        "group_ids": qs.get("group_ids", qs.get("team_ids", [""]))[0],
+        "levels": qs.get("levels", qs.get("allowed_levels", [""]))[0],
+        "include_self": qs.get("include_self", ["false"])[0].lower() in ("1", "true", "yes", "on"),
+    }
+    filename, data = parse_upload(handler)
+    query_name = qs.get("filename", qs.get("name", [""]))[0]
+    package_name = normalize_datapackage_name(query_name or filename or "taklite-plugin.dp.zip")
+    hash_value = hashlib.sha256(data).hexdigest()
+    audience = plugin_datapackage_audience(user["id"], payload)
+    policy = normalize_datapackage_policy("sender")
+    upsert_package(
+        hash_value,
+        package_name,
+        user.get("username", ""),
+        data,
+        tak_marti_base_url(),
+        creator_user_id=user["id"],
+        visibility="private",
+        policy=policy,
+    )
+    allowed_user_ids = audience["allowed_user_ids"]
+    set_datapackage_recipients(hash_value, allowed_user_ids)
+    if not allowed_user_ids:
+        package = row_to_package(find_package(hash_value))
+        record_audit_event(
+            "plugin_datapackage_upload",
+            actor_type="portal_user",
+            actor_id=user["id"],
+            actor_name=user.get("username", ""),
+            remote=handler.client_address[0],
+            outcome="blocked",
+            reason_code="no_allowed_recipients",
+            details={"hash": hash_value, "name": package_name, "blocked": audience["blocked_count"], "audience": audience["audience"]},
+        )
+        return {
+            "ok": False,
+            "package": package,
+            "url": tak_marti_content_url(hash_value),
+            "sent": 0,
+            "pending": 0,
+            "blocked": audience["blocked_count"],
+            "failed": 0,
+            "results": audience["items"],
+            "audience": audience,
+            "error": "no allowed recipients for selected audience",
+        }
+    send_result = send_datapackage_to_clients({"hash": hash_value, "user_ids": allowed_user_ids})
+    send_result["audience"] = audience
+    record_audit_event(
+        "plugin_datapackage_upload",
+        actor_type="portal_user",
+        actor_id=user["id"],
+        actor_name=user.get("username", ""),
+        remote=handler.client_address[0],
+        outcome="ok" if send_result.get("ok") else "failed",
+        reason_code="uploaded",
+        details={"hash": hash_value, "name": package_name, "sent": send_result.get("sent", 0), "pending": send_result.get("pending", 0), "blocked": send_result.get("blocked", 0), "audience": audience["audience"]},
+    )
+    return send_result
+
+
+def plugin_send_datapackage(sender_user_id, payload):
+    hash_value = (payload.get("hash") or "").strip()
+    if not hash_value:
+        raise ValueError("hash is required")
+    row = find_package(hash_value)
+    if not row:
+        raise ValueError("datapackage not found")
+    package = row_to_package(row)
+    creator = package.get("CreatorUserId")
+    sender = subject_policy(sender_user_id)
+    if creator and int(creator) != int(sender_user_id) and not (sender and sender.get("can_send_all")):
+        raise PermissionError("only the package creator or a send-all role can resend this package")
+    audience = plugin_datapackage_audience(sender_user_id, payload)
+    set_datapackage_recipients(hash_value, audience["allowed_user_ids"])
+    if not audience["allowed_user_ids"]:
+        record_audit_event(
+            "plugin_datapackage_send",
+            actor_type="portal_user",
+            actor_id=sender_user_id,
+            actor_name=audience["sender"].get("username", ""),
+            outcome="blocked",
+            reason_code="no_allowed_recipients",
+            details={"hash": hash_value, "blocked": audience["blocked_count"], "audience": audience["audience"]},
+        )
+        return {
+            "ok": False,
+            "package": package,
+            "url": tak_marti_content_url(hash_value),
+            "sent": 0,
+            "pending": 0,
+            "blocked": audience["blocked_count"],
+            "failed": 0,
+            "results": audience["items"],
+            "audience": audience,
+            "error": "no allowed recipients for selected audience",
+        }
+    result = send_datapackage_to_clients({"hash": hash_value, "user_ids": audience["allowed_user_ids"]})
+    result["audience"] = audience
+    record_audit_event(
+        "plugin_datapackage_send",
+        actor_type="portal_user",
+        actor_id=sender_user_id,
+        actor_name=audience["sender"].get("username", ""),
+        outcome="ok" if result.get("ok") else "failed",
+        reason_code="sent_or_queued",
+        details={"hash": hash_value, "sent": result.get("sent", 0), "pending": result.get("pending", 0), "blocked": result.get("blocked", 0), "audience": audience["audience"]},
+    )
+    return result
 
 
 def marti_groups_response():
@@ -1145,7 +1822,7 @@ def mission_empty_response(kind="MissionList"):
     return {"version": 3, "type": kind, "data": []}
 
 
-def create_policy_subject(username, role_id=None, group_ids=None):
+def create_policy_subject(username, role_id=None, group_ids=None, access_level=None):
     username = validate_portal_username(username)
     with db_connect() as conn:
         conn.execute("""
@@ -1156,12 +1833,12 @@ def create_policy_subject(username, role_id=None, group_ids=None):
         profile_id = conn.execute("select id from cert_profiles where name = ?", (username,)).fetchone()["id"]
         conn.execute("""
             insert into portal_users
-              (username, password_hash, display_name, description, cert_profile_id, allow_redownload, created_at, revoked_at, role_id)
-            values (?, ?, ?, ?, ?, 0, ?, null, ?)
-        """, (username, password_hash("atakatak"), username, "", profile_id, utc_now(), role_id))
+              (username, password_hash, plugin_api_token, display_name, description, cert_profile_id, allow_redownload, created_at, revoked_at, role_id, access_level)
+            values (?, ?, ?, ?, ?, ?, 0, ?, null, ?, ?)
+        """, (username, password_hash("atakatak"), new_plugin_token(), username, "", profile_id, utc_now(), role_id, validate_access_level(access_level)))
         user_id = conn.execute("select id from portal_users where username = ?", (username,)).fetchone()["id"]
         conn.commit()
-    return set_user_access(user_id, role_id=role_id, group_ids=group_ids)
+    return set_user_access(user_id, role_id=role_id, group_ids=group_ids, access_level=access_level)
 
 
 def build_bulk_usernames(prefix, count):
@@ -1198,7 +1875,7 @@ def ensure_bulk_users_available(usernames):
         raise ValueError(f"bulk user/profile already exists: {preview}{suffix}")
 
 
-def create_bulk_portal_users(prefix, count, description="", allow_redownload=False, base_url="", role_id=None, group_ids=None):
+def create_bulk_portal_users(prefix, count, description="", allow_redownload=False, base_url="", role_id=None, group_ids=None, access_level=None):
     usernames = build_bulk_usernames(prefix, count)
     ensure_bulk_users_available(usernames)
     shared_password = BULK_PORTAL_PASSWORD
@@ -1212,8 +1889,8 @@ def create_bulk_portal_users(prefix, count, description="", allow_redownload=Fal
             note or f"Bulk user {username}",
             allow_redownload,
         ]
-        if role_id or group_ids:
-            create_args.extend([role_id, group_ids])
+        if role_id or group_ids or access_level:
+            create_args.extend([role_id, group_ids, access_level])
         user = create_portal_user(*create_args)
         portal_path = user.get("portal_path") or "/connect/"
         items.append({
@@ -1241,12 +1918,16 @@ def portal_user_row(row):
     revoked = bool(row["revoked_at"] or row["profile_revoked_at"])
     username = row["username"]
     role_id = row["role_id"] if "role_id" in row.keys() else None
+    access_level = row["access_level"] if "access_level" in row.keys() else None
     return {
         "id": row["id"],
         "username": username,
         "display_name": row["display_name"] or "",
         "description": row["description"] or "",
+        "assigned_ip": row["assigned_ip"] if "assigned_ip" in row.keys() and row["assigned_ip"] else "",
+        "device_mac": row["device_mac"] if "device_mac" in row.keys() and row["device_mac"] else "",
         "cert_profile_id": row["cert_profile_id"],
+        "plugin_api_token": row["plugin_api_token"] if "plugin_api_token" in row.keys() else "",
         "profile_name": profile,
         "connect_string": row["connect_string"] or "",
         "allow_redownload": bool(row["allow_redownload"]),
@@ -1257,6 +1938,7 @@ def portal_user_row(row):
         "revoked_at": row["revoked_at"] or row["profile_revoked_at"] or "",
         "revoked": revoked,
         "role_id": role_id,
+        "access_level": access_level,
         "role_name": "",
         "groups": [],
         "group_ids": [],
@@ -1327,33 +2009,40 @@ def find_portal_user_by_username(username):
         """, ((username or "").strip(),)).fetchone()
 
 
-def create_portal_user(username, password, display_name="", description="", allow_redownload=False, role_id=None, group_ids=None):
+def create_portal_user(username, password, display_name="", description="", allow_redownload=False, role_id=None, group_ids=None, access_level=None, assigned_ip="", device_mac=""):
     username = validate_portal_username(username)
+    assigned_ip = validate_assigned_ip(assigned_ip)
+    device_mac = validate_device_mac(device_mac)
     if len(password or "") < 8:
         raise ValueError("portal password must be at least 8 characters")
     with db_connect() as conn:
         if conn.execute("select id from portal_users where username = ?", (username,)).fetchone():
             raise ValueError("a portal user with that username already exists")
     profile_name = unique_profile_name(username)
-    profile = create_cert_profile(profile_name, description or f"Portal user {username}")
+    plugin_token = new_plugin_token()
+    profile = create_cert_profile(profile_name, description or f"Portal user {username}", plugin_token=plugin_token)
     with db_connect() as conn:
         conn.execute("""
             insert into portal_users
-              (username, password_hash, display_name, description, cert_profile_id, allow_redownload, created_at, revoked_at)
-            values (?, ?, ?, ?, ?, ?, ?, null)
+              (username, password_hash, plugin_api_token, display_name, description, assigned_ip, device_mac, cert_profile_id, allow_redownload, created_at, revoked_at, access_level)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null, ?)
         """, (
             username,
             password_hash(password),
+            plugin_token,
             (display_name or username).strip(),
             (description or "").strip(),
+            assigned_ip,
+            device_mac,
             profile["id"],
             1 if allow_redownload else 0,
             utc_now(),
+            validate_access_level(access_level),
         ))
         conn.commit()
         user_id = conn.execute("select id from portal_users where username = ?", (username,)).fetchone()["id"]
-    if role_id or group_ids:
-        return set_user_access(user_id, role_id=role_id, group_ids=group_ids)
+    if role_id or group_ids or access_level:
+        return set_user_access(user_id, role_id=role_id, group_ids=group_ids, access_level=access_level)
     return attach_access_to_users([portal_user_row(find_portal_user(user_id))])[0]
 
 
@@ -1420,16 +2109,18 @@ def reset_portal_password(user_id, password):
     return portal_user_row(find_portal_user(user_id))
 
 
-def edit_portal_user(user_id, display_name="", description=""):
+def edit_portal_user(user_id, display_name="", description="", assigned_ip="", device_mac=""):
+    assigned_ip = validate_assigned_ip(assigned_ip)
+    device_mac = validate_device_mac(device_mac)
     with db_connect() as conn:
         row = conn.execute("select id from portal_users where id = ?", (user_id,)).fetchone()
         if not row:
             raise ValueError("portal user not found")
         conn.execute("""
             update portal_users
-            set display_name = ?, description = ?
+            set display_name = ?, description = ?, assigned_ip = ?, device_mac = ?
             where id = ?
-        """, ((display_name or "").strip(), (description or "").strip(), user_id))
+        """, ((display_name or "").strip(), (description or "").strip(), assigned_ip, device_mac, user_id))
         conn.commit()
     return portal_user_row(find_portal_user(user_id))
 
@@ -1478,13 +2169,14 @@ def reissue_portal_user(user_id):
     if row["cert_profile_id"]:
         revoke_cert_profile(row["cert_profile_id"])
     profile_name = unique_profile_name(row["username"])
-    profile = create_cert_profile(profile_name, row["description"] or f"Portal user {row['username']}")
+    plugin_token = row["plugin_api_token"] or new_plugin_token()
+    profile = create_cert_profile(profile_name, row["description"] or f"Portal user {row['username']}", plugin_token=plugin_token)
     with db_connect() as conn:
         conn.execute("""
             update portal_users
-            set cert_profile_id = ?, first_download_at = null, last_download_at = null, download_count = 0, revoked_at = null
+            set cert_profile_id = ?, plugin_api_token = ?, first_download_at = null, last_download_at = null, download_count = 0, revoked_at = null
             where id = ?
-        """, (profile["id"], user_id))
+        """, (profile["id"], plugin_token, user_id))
         conn.execute("delete from portal_sessions where user_id = ?", (user_id,))
         conn.commit()
     return portal_user_row(find_portal_user(user_id))
@@ -1595,32 +2287,286 @@ def cot_delivery_allowed(sender_user_id, target_user_id, enforce=None):
 
 
 def package_visible_to_user(package, user_id, enforce=None):
+    return package_access_for_user(package, user_id, enforce)["allowed"]
+
+
+def package_explicit_recipient_ids(hash_value):
+    hash_value = (hash_value or "").strip()
+    if not hash_value:
+        return set()
+    with db_connect() as conn:
+        rows = conn.execute("select target_user_id from datapackage_recipients where package_hash = ?", (hash_value,)).fetchall()
+    return {int(row["target_user_id"]) for row in rows}
+
+
+def set_datapackage_recipients(hash_value, user_ids):
+    hash_value = (hash_value or "").strip()
+    user_ids = sorted({int(user_id) for user_id in (user_ids or []) if str(user_id).strip()})
+    if not hash_value:
+        raise ValueError("hash is required")
+    with db_connect() as conn:
+        conn.execute("delete from datapackage_recipients where package_hash = ?", (hash_value,))
+        conn.executemany(
+            "insert or ignore into datapackage_recipients (package_hash, target_user_id, created_at) values (?, ?, ?)",
+            [(hash_value, user_id, utc_now()) for user_id in user_ids],
+        )
+        conn.commit()
+    return user_ids
+
+
+def package_access_for_user(package, user_id, enforce=None):
     if enforce is None:
         enforce = ACCESS_CONTROL_ENFORCE
-    if not enforce:
-        return True
-    if not user_id:
-        visibility = (package.get("Visibility") or package.get("Tool") or "private").lower()
-        tool = (package.get("Tool") or "").lower()
-        return visibility == "public" or tool == "public"
-    if not access_policy_active():
-        return True
     visibility = (package.get("Visibility") or package.get("Tool") or "private").lower()
     tool = (package.get("Tool") or "").lower()
     if visibility == "private" and tool == "public":
         visibility = "public"
+    result = {
+        "allowed": False,
+        "reason_code": "blocked_unknown",
+        "reason": "Blocked by TAKlite package policy.",
+    }
     creator_user_id = package.get("CreatorUserId")
+    explicit_recipients = package_explicit_recipient_ids(package.get("Hash", ""))
+    if explicit_recipients:
+        if not user_id:
+            result.update({"reason_code": "blocked_no_identity", "reason": "Client identity is required for packages with explicit recipients."})
+            return result
+        if creator_user_id and int(user_id) == int(creator_user_id):
+            result.update({"allowed": True, "reason_code": "allowed_creator", "reason": "User created this package."})
+            return result
+        if int(user_id) not in explicit_recipients:
+            result.update({"reason_code": "blocked_explicit_audience", "reason": "User is not in the package's selected recipient list."})
+            return result
+    if not enforce:
+        result.update({"allowed": True, "reason_code": "allowed_enforcement_off", "reason": "Access enforcement is off."})
+        return result
+    if not user_id:
+        if visibility == "public" or tool == "public":
+            result.update({"allowed": True, "reason_code": "allowed_public", "reason": "Public package."})
+        else:
+            result.update({"reason_code": "blocked_no_identity", "reason": "Client certificate identity is required for private packages."})
+        return result
+    if not access_policy_active():
+        result.update({"allowed": True, "reason_code": "allowed_open_default", "reason": "No access policy is assigned; server is in open default mode."})
+        return result
     if visibility == "public":
-        return True
+        result.update({"allowed": True, "reason_code": "allowed_public", "reason": "Public package."})
+        return result
     if not creator_user_id:
-        return False
+        result.update({"reason_code": "blocked_no_creator_identity", "reason": "Private package has no mapped creator identity."})
+        return result
     if int(user_id) == int(creator_user_id):
-        return True
-    return can_subject_see(user_id, creator_user_id) and can_subject_send(creator_user_id, user_id)
+        result.update({"allowed": True, "reason_code": "allowed_creator", "reason": "User created this package."})
+        return result
+    policy_mode = (package.get("PolicyMode") or "sender").lower()
+    allowed_levels = package.get("AllowedLevels") or []
+    if isinstance(allowed_levels, str):
+        allowed_levels = deserialize_levels(allowed_levels)
+    viewer = subject_policy(user_id)
+    if policy_mode.startswith("level_") and allowed_levels:
+        if viewer and viewer.get("can_see_all"):
+            result.update({"allowed": True, "reason_code": "allowed_admin", "reason": "User role can see all packages."})
+            return result
+        viewer_level = viewer.get("access_level") if viewer else None
+        if viewer_level is None or int(viewer_level) not in set(int(level) for level in allowed_levels):
+            result.update({
+                "reason_code": "blocked_level_policy",
+                "reason": f"Package requires {parse_datapackage_policy_label(policy_mode, serialize_levels(allowed_levels))}; user level is {viewer_level or 'not assigned'}.",
+            })
+            return result
+    if not can_subject_send(creator_user_id, user_id):
+        result.update({"reason_code": "blocked_sender_policy", "reason": "Package creator is not allowed to send to requester."})
+        return result
+    if not can_subject_receive(user_id, creator_user_id):
+        result.update({"reason_code": "blocked_receive_policy", "reason": "Requester is not allowed to receive from the package creator."})
+        return result
+    if can_send_datapackage(creator_user_id, user_id):
+        result.update({"allowed": True, "reason_code": "allowed_package_policy", "reason": "Package creator can send to requester and requester can receive from creator."})
+        return result
+    return result
 
 
 def package_visible_to_request(row, handler):
     return package_visible_to_user(row_to_package(row), handler.authenticated_user_id(), ACCESS_CONTROL_ENFORCE)
+
+
+def normalize_datapackage_policy(mode, allowed_levels=None, max_level=None):
+    mode = (mode or "sender").strip().lower()
+    if mode in ("sender", "sender_policy"):
+        return {"mode": "sender", "allowed_levels": [], "label": "Sender policy"}
+    if mode not in ("level_only", "level_all"):
+        raise ValueError("package policy mode must be sender, level_only, or level_all")
+    if max_level not in (None, ""):
+        levels = [validate_access_level(max_level, allow_empty=False)]
+    else:
+        levels = [validate_access_level(level, allow_empty=False) for level in (allowed_levels or []) if str(level).strip()]
+    levels = sorted(set(levels))
+    if not levels:
+        raise ValueError("select at least one level for this package policy")
+    if mode == "level_all":
+        levels = list(range(1, max(levels) + 1))
+    return {"mode": mode, "allowed_levels": levels, "label": parse_datapackage_policy_label(mode, serialize_levels(levels))}
+
+
+def update_datapackage_policy(hash_value, mode, allowed_levels=None, max_level=None):
+    hash_value = (hash_value or "").strip()
+    if not hash_value:
+        raise ValueError("hash is required")
+    policy = normalize_datapackage_policy(mode, allowed_levels, max_level)
+    with db_connect() as conn:
+        row = conn.execute("select Hash from datapackages where Hash = ?", (hash_value,)).fetchone()
+        if not row:
+            raise ValueError("datapackage not found")
+        conn.execute(
+            "update datapackages set PolicyMode = ?, AllowedLevels = ? where Hash = ?",
+            (policy["mode"], serialize_levels(policy["allowed_levels"]), hash_value),
+        )
+        conn.commit()
+    row = find_package(hash_value)
+    return {"ok": True, "package": row_to_package(row)}
+
+
+def datapackage_access_preview(hash_value):
+    row = find_package(hash_value)
+    if not row:
+        raise ValueError("datapackage not found")
+    package = row_to_package(row)
+    users = [user for user in list_portal_users() if not user.get("revoked")]
+    rows = []
+    for user in users:
+        access = package_access_for_user(package, user["id"], ACCESS_CONTROL_ENFORCE)
+        rows.append({
+            "user_id": user["id"],
+            "username": user["username"],
+            "display_name": user.get("display_name", ""),
+            "role_name": user.get("role_name", ""),
+            "access_level": user.get("access_level"),
+            "groups": user.get("groups", []),
+            "allowed": access["allowed"],
+            "reason_code": access["reason_code"],
+            "reason": access["reason"],
+        })
+    return {
+        "package": package,
+        "policy": {
+            "mode": package["PolicyMode"],
+            "allowed_levels": package["AllowedLevels"],
+            "label": package["PolicyLabel"],
+        },
+        "allowed_count": sum(1 for item in rows if item["allowed"]),
+        "blocked_count": sum(1 for item in rows if not item["allowed"]),
+        "items": rows,
+    }
+
+
+def record_datapackage_delivery(package_hash, target_user_id=None, status="pending", reason_code="pending_offline", reason="", target_uid="", target_callsign="", increment_attempt=False):
+    now = utc_now()
+    attempts = 1 if increment_attempt else 0
+    with db_connect() as conn:
+        conn.execute("""
+            insert into datapackage_deliveries
+              (package_hash, target_user_id, target_uid, target_callsign, status, reason_code, reason, attempts, created_at, updated_at, delivered_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            package_hash,
+            target_user_id,
+            (target_uid or "").strip(),
+            (target_callsign or "").strip(),
+            status,
+            reason_code,
+            reason,
+            attempts,
+            now,
+            now,
+            now if status == "sent" else None,
+        ))
+        conn.commit()
+        delivery_id = conn.execute("select last_insert_rowid()").fetchone()[0]
+    return delivery_id
+
+
+def update_datapackage_delivery(delivery_id, status, reason_code, reason, target_uid="", target_callsign="", increment_attempt=True):
+    now = utc_now()
+    with db_connect() as conn:
+        conn.execute("""
+            update datapackage_deliveries
+            set status = ?,
+                reason_code = ?,
+                reason = ?,
+                target_uid = coalesce(nullif(?, ''), target_uid),
+                target_callsign = coalesce(nullif(?, ''), target_callsign),
+                attempts = attempts + ?,
+                updated_at = ?,
+                delivered_at = case when ? = 'sent' then ? else delivered_at end
+            where id = ?
+        """, (
+            status,
+            reason_code,
+            reason,
+            (target_uid or "").strip(),
+            (target_callsign or "").strip(),
+            1 if increment_attempt else 0,
+            now,
+            status,
+            now,
+            delivery_id,
+        ))
+        conn.commit()
+
+
+def list_pending_datapackage_deliveries(user_id):
+    with db_connect() as conn:
+        return conn.execute("""
+            select *
+            from datapackage_deliveries
+            where target_user_id = ?
+              and status = 'pending'
+            order by id asc
+            limit 25
+        """, (user_id,)).fetchall()
+
+
+def delivery_row(row):
+    return {
+        "id": row["id"],
+        "package_hash": row["package_hash"],
+        "target_user_id": row["target_user_id"],
+        "target_uid": row["target_uid"] or "",
+        "target_callsign": row["target_callsign"] or "",
+        "status": row["status"],
+        "reason_code": row["reason_code"],
+        "reason": row["reason"],
+        "attempts": row["attempts"],
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+        "delivered_at": row["delivered_at"] or "",
+    }
+
+
+def list_datapackage_deliveries(hash_value="", limit=100):
+    params = []
+    where = ""
+    if hash_value:
+        where = "where d.package_hash = ?"
+        params.append(hash_value)
+    params.append(int(limit))
+    with db_connect() as conn:
+        rows = conn.execute(f"""
+            select d.*, u.username, u.display_name
+            from datapackage_deliveries d
+            left join portal_users u on u.id = d.target_user_id
+            {where}
+            order by d.id desc
+            limit ?
+        """, params).fetchall()
+    items = []
+    for row in rows:
+        item = delivery_row(row)
+        item["username"] = row["username"] or ""
+        item["display_name"] = row["display_name"] or ""
+        items.append(item)
+    return items
 
 
 def run_openssl(args):
@@ -1754,10 +2700,6 @@ def build_server_pref(connect_string, truststore_name, client_cert_name, descrip
   </preference>
   <preference version="1" name="com.atakmap.app_preferences">
     <entry key="displayServerConnectionWidget" class="class java.lang.Boolean">true</entry>
-    <entry key="caLocation" class="class java.lang.String">cert/{html.escape(truststore_name)}</entry>
-    <entry key="caPassword" class="class java.lang.String">{html.escape(CERT_PASSWORD)}</entry>
-    <entry key="clientPassword" class="class java.lang.String">{html.escape(CERT_PASSWORD)}</entry>
-    <entry key="certificateLocation" class="class java.lang.String">cert/{html.escape(client_cert_name)}</entry>
     <entry key="apiSecureServerPort" class="class java.lang.String">{HTTPS_PUBLIC_PORT}</entry>
     <entry key="apiUnsecureServerPort" class="class java.lang.String">{HTTP_PUBLIC_PORT}</entry>
   </preference>
@@ -1777,12 +2719,47 @@ def build_manifest(uid, display_name, truststore_name, client_cert_name):
     <Content ignore="false" zipEntry="certs/server.pref"/>
     <Content ignore="false" zipEntry="certs/{html.escape(truststore_name)}"/>
     <Content ignore="false" zipEntry="certs/{html.escape(client_cert_name)}"/>
+    <Content ignore="false" zipEntry="certs/taklite-plugin.json"/>
   </Contents>
 </MissionPackageManifest>
 """
 
 
-def create_cert_profile(name, description=""):
+def build_plugin_config(name, plugin_token=""):
+    plugin_api_base_url = f"http://{SERVER_HOST}:{HTTP_PUBLIC_PORT}"
+    return json.dumps({
+        "schema": "taklite-plugin-profile-v1",
+        "name": name,
+        "server_url": plugin_api_base_url,
+        "server_urls": [
+            plugin_api_base_url,
+            f"https://{SERVER_HOST}:{HTTPS_PUBLIC_PORT}",
+        ],
+        "connect_string": f"{SERVER_HOST}:{COT_TLS_PUBLIC_PORT}:ssl",
+        "ports": {
+            "http": HTTP_PUBLIC_PORT,
+            "https": HTTPS_PUBLIC_PORT,
+            "cot_tcp": COT_PUBLIC_PORT,
+            "cot_tls": COT_TLS_PUBLIC_PORT,
+        },
+        "plugin_token": plugin_token or "",
+        "default_audience_mode": "all_allowed",
+        "api": {
+            "me": "/api/plugin/me",
+            "audience": "/api/plugin/audience",
+            "preview": "/api/plugin/datapackages/preview",
+            "upload": "/api/plugin/datapackages/upload",
+            "send": "/api/plugin/datapackages/send",
+        },
+    }, indent=2) + "\n"
+
+
+def build_portal_user_plugin_config(user):
+    profile_name = user["profile_name"] or user["username"]
+    return build_plugin_config(profile_name, user["plugin_api_token"] or "")
+
+
+def create_cert_profile(name, description="", plugin_token=""):
     name = safe_profile_name(name)
     description = (description or "").strip()
     truststore = packaged_truststore_file()
@@ -1835,6 +2812,7 @@ def create_cert_profile(name, description=""):
     with zipfile.ZipFile(dp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("MANIFEST/manifest.xml", manifest)
         zf.writestr("certs/server.pref", server_pref)
+        zf.writestr("certs/taklite-plugin.json", build_plugin_config(name, plugin_token))
         zf.write(truststore, f"certs/{truststore.name}")
         zf.write(client_p12, f"certs/{client_p12.name}")
     dp_zip.chmod(0o644)
@@ -1931,6 +2909,7 @@ class CotRelay:
                 self.clients[handler]["username"] = identity["username"]
         self.send_recent(handler)
         self.send_to(handler, server_status_event())
+        self.deliver_pending(handler)
 
     def remove(self, handler):
         with self.lock:
@@ -1957,15 +2936,22 @@ class CotRelay:
                 pass
         return len(handlers)
 
-    def update_client(self, remote, uid, callsign):
+    def update_client(self, remote, uid, callsign, user_id=None):
+        learned_user_id = user_id
         with self.lock:
             for info in self.clients.values():
                 if info["remote"] == remote:
+                    learned_user_id = learned_user_id or info.get("user_id")
                     if uid:
                         info["uid"] = uid
                     if callsign:
                         info["callsign"] = callsign
                     info["last_seen"] = utc_now()
+        if learned_user_id and uid:
+            try:
+                learn_portal_user_device(learned_user_id, device_id=uid)
+            except ValueError:
+                pass
 
     def snapshot(self):
         with self.lock:
@@ -2037,6 +3023,54 @@ class CotRelay:
         missed = sorted(requested - matched)
         return {"sent": sum(1 for item in results if item["sent"]), "results": results, "missed": missed}
 
+    def send_to_user_ids(self, event, user_ids):
+        requested = {int(user_id) for user_id in (user_ids or []) if str(user_id).strip()}
+        with self.lock:
+            handlers = [(handler, dict(info)) for handler, info in self.clients.items()]
+        results = []
+        matched = set()
+        for handler, info in handlers:
+            user_id = info.get("user_id")
+            if user_id is None or int(user_id) not in requested:
+                continue
+            matched.add(int(user_id))
+            sent = self.send_to(handler, event)
+            results.append({
+                "user_id": int(user_id),
+                "username": info.get("username") or "",
+                "uid": info.get("uid") or "",
+                "callsign": info.get("callsign") or "Unknown",
+                "ip": info.get("ip") or "",
+                "sent": sent,
+                "reason_code": "sent" if sent else "send_failed_socket",
+                "reason": "File-share event sent to connected client." if sent else "Socket closed while sending file-share event.",
+            })
+        missed = sorted(requested - matched)
+        return {"sent": sum(1 for item in results if item["sent"]), "results": results, "missed_user_ids": missed}
+
+    def deliver_pending(self, handler):
+        user_id = getattr(handler, "user_id", None)
+        if not user_id:
+            return
+        deliveries = list_pending_datapackage_deliveries(user_id)
+        for delivery in deliveries:
+            row = find_package(delivery["package_hash"])
+            if not row:
+                update_datapackage_delivery(delivery["id"], "failed", "package_missing", "Package is no longer available on the server.")
+                continue
+            package = row_to_package(row)
+            access = package_access_for_user(package, user_id, ACCESS_CONTROL_ENFORCE)
+            if not access["allowed"]:
+                update_datapackage_delivery(delivery["id"], "blocked", access["reason_code"], access["reason"])
+                continue
+            sent = self.send_to(handler, fileshare_event(package))
+            update_datapackage_delivery(
+                delivery["id"],
+                "sent" if sent else "pending",
+                "sent_on_reconnect" if sent else "send_failed_socket",
+                "Pending package pushed after client reconnect." if sent else "Client socket closed while retrying pending package.",
+            )
+
     def heartbeat(self):
         self.broadcast(None, server_status_event())
 
@@ -2069,6 +3103,11 @@ class CotHandler(BaseRequestHandler):
         identity = client_identity_for_cert(peer_cert_cn)
         self.user_id = identity["user_id"] if identity else None
         self.cert_cn = peer_cert_cn
+        if self.user_id:
+            try:
+                learn_portal_user_device(self.user_id, source_ip=self.client_address[0])
+            except ValueError:
+                pass
         if ACCESS_CONTROL_ENFORCE and not self.user_id:
             print(f"CoT reject {self.remote} transport={transport} cert_cn={peer_cert_cn or 'none'} reason=missing_policy_identity")
             try:
@@ -2691,6 +3730,14 @@ def validate_datapackage_upload(filename, data):
 def upload_datapackage_from_request(handler, qs, response_url="content"):
     creator_user_id = handler.authenticated_user_id()
     if ACCESS_CONTROL_ENFORCE and not creator_user_id:
+        record_audit_event(
+            "tak_datapackage_upload",
+            actor_type="tak_client",
+            remote=handler.client_address[0],
+            outcome="blocked",
+            reason_code="blocked_no_identity",
+            details={"path": handler.path},
+        )
         handler.send_json({"error": "client certificate identity required"}, HTTPStatus.FORBIDDEN)
         return
     filename, data = parse_upload(handler)
@@ -2698,6 +3745,22 @@ def upload_datapackage_from_request(handler, qs, response_url="content"):
     query_name = qs.get("filename", qs.get("name", [""]))[0]
     creator_uid = qs.get("creatorUid", qs.get("creatoruid", [""]))[0]
     package_name = normalize_datapackage_name(query_name or filename or f"{hash_value}.dp.zip")
+    policy = parse_datapackage_filename_policy(package_name)
+    if policy["allowed_levels"] and creator_user_id:
+        creator = subject_policy(creator_user_id)
+        creator_level = creator.get("access_level") if creator else None
+        if creator_level is not None and max(policy["allowed_levels"]) > int(creator_level):
+            record_audit_event(
+                "tak_datapackage_upload",
+                actor_type="portal_user",
+                actor_id=creator_user_id,
+                remote=handler.client_address[0],
+                outcome="blocked",
+                reason_code="blocked_level_tag",
+                details={"filename": package_name, "policy": policy, "creator_level": creator_level},
+            )
+            handler.send_json({"error": "datapackage level tag exceeds sender access level"}, HTTPStatus.FORBIDDEN)
+            return
     content_url = upsert_package(
         hash_value,
         package_name,
@@ -2706,12 +3769,51 @@ def upload_datapackage_from_request(handler, qs, response_url="content"):
         tak_marti_base_url(),
         creator_user_id=creator_user_id,
         visibility="private",
+        policy=policy,
     )
     hash_value = hash_value or hashlib.sha256(data).hexdigest()
+    record_audit_event(
+        "tak_datapackage_upload",
+        actor_type="portal_user" if creator_user_id else "tak_client",
+        actor_id=creator_user_id,
+        actor_name=creator_uid,
+        remote=handler.client_address[0],
+        outcome="ok",
+        reason_code="uploaded",
+        details={"hash": hash_value, "name": package_name, "policy": policy},
+    )
     if response_url == "metadata":
         handler.send_text(tak_marti_metadata_tool_url(hash_value))
     else:
         handler.send_text(content_url)
+
+
+def admin_upload_datapackage(handler, qs):
+    filename, data = parse_upload(handler)
+    query_name = qs.get("filename", qs.get("name", [""]))[0]
+    package_name = normalize_datapackage_name(query_name or filename or "admin-upload.dp.zip")
+    hash_value = hashlib.sha256(data).hexdigest()
+    policy = parse_datapackage_filename_policy(package_name)
+    upsert_package(
+        hash_value,
+        package_name,
+        "TAKlite-Admin",
+        data,
+        tak_marti_base_url(),
+        creator_user_id=None,
+        visibility="public",
+        policy=policy,
+    )
+    row = find_package(hash_value)
+    record_audit_event(
+        "admin_datapackage_upload",
+        actor_type="admin",
+        remote=handler.client_address[0],
+        outcome="ok",
+        reason_code="uploaded",
+        details={"hash": hash_value, "name": package_name, "policy": policy},
+    )
+    return {"ok": True, "package": row_to_package(row), "url": tak_marti_content_url(hash_value)}
 
 
 def datapackage_content_row(handler, qs):
@@ -2725,7 +3827,18 @@ def datapackage_hash_row(handler, hash_value):
         handler.send_json({"error": "package not found"}, HTTPStatus.NOT_FOUND)
         return None
     if not package_visible_to_request(row, handler):
-        handler.send_json({"error": "package not allowed"}, HTTPStatus.FORBIDDEN)
+        package = row_to_package(row)
+        access = package_access_for_user(package, handler.authenticated_user_id(), ACCESS_CONTROL_ENFORCE)
+        record_audit_event(
+            "datapackage_fetch",
+            actor_type="tak_client",
+            actor_id=handler.authenticated_user_id(),
+            remote=handler.client_address[0],
+            outcome="blocked",
+            reason_code=access["reason_code"],
+            details={"hash": hash_value, "name": package.get("Name", ""), "reason": access["reason"]},
+        )
+        handler.send_json({"error": "package not allowed", "reason_code": access["reason_code"], "reason": access["reason"]}, HTTPStatus.FORBIDDEN)
         return None
     package = Path(row["Path"])
     if not package.exists():
@@ -2747,6 +3860,121 @@ def send_datapackage_to_clients(payload):
         raise ValueError("datapackage file missing")
     send_all = bool(payload.get("all_clients", False))
     client_uids = [str(uid).strip() for uid in payload.get("client_uids", []) if str(uid).strip()]
+    user_ids = []
+    for user_id in payload.get("user_ids", []):
+        try:
+            user_ids.append(int(user_id))
+        except (TypeError, ValueError):
+            continue
+    user_ids = sorted(set(user_ids))
+    if user_ids:
+        users = {user["id"]: user for user in list_portal_users() if not user.get("revoked")}
+        event = fileshare_event(package)
+        allowed_ids = []
+        results = []
+        for user_id in user_ids:
+            user = users.get(user_id)
+            if not user:
+                results.append({
+                    "user_id": user_id,
+                    "username": "",
+                    "status": "failed",
+                    "sent": False,
+                    "reason_code": "target_not_found",
+                    "reason": "Target user does not exist or is revoked.",
+                })
+                continue
+            access = package_access_for_user(package, user_id, ACCESS_CONTROL_ENFORCE)
+            if not access["allowed"]:
+                record_datapackage_delivery(hash_value, user_id, "blocked", access["reason_code"], access["reason"])
+                results.append({
+                    "user_id": user_id,
+                    "username": user["username"],
+                    "status": "blocked",
+                    "sent": False,
+                    "reason_code": access["reason_code"],
+                    "reason": access["reason"],
+                })
+                continue
+            allowed_ids.append(user_id)
+        relay_result = RELAY.send_to_user_ids(event, allowed_ids)
+        sent_by_user = {item["user_id"]: item for item in relay_result["results"]}
+        for user_id in allowed_ids:
+            user = users[user_id]
+            sent_info = sent_by_user.get(user_id)
+            if sent_info and sent_info["sent"]:
+                record_datapackage_delivery(
+                    hash_value,
+                    user_id,
+                    "sent",
+                    sent_info["reason_code"],
+                    sent_info["reason"],
+                    target_uid=sent_info.get("uid", ""),
+                    target_callsign=sent_info.get("callsign", ""),
+                    increment_attempt=True,
+                )
+                results.append({
+                    "user_id": user_id,
+                    "username": user["username"],
+                    "status": "sent",
+                    "sent": True,
+                    "uid": sent_info.get("uid", ""),
+                    "callsign": sent_info.get("callsign", ""),
+                    "reason_code": sent_info["reason_code"],
+                    "reason": sent_info["reason"],
+                })
+            elif sent_info:
+                record_datapackage_delivery(
+                    hash_value,
+                    user_id,
+                    "pending",
+                    sent_info["reason_code"],
+                    sent_info["reason"],
+                    target_uid=sent_info.get("uid", ""),
+                    target_callsign=sent_info.get("callsign", ""),
+                    increment_attempt=True,
+                )
+                results.append({
+                    "user_id": user_id,
+                    "username": user["username"],
+                    "status": "pending",
+                    "sent": False,
+                    "uid": sent_info.get("uid", ""),
+                    "callsign": sent_info.get("callsign", ""),
+                    "reason_code": sent_info["reason_code"],
+                    "reason": sent_info["reason"],
+                })
+            else:
+                record_datapackage_delivery(
+                    hash_value,
+                    user_id,
+                    "pending",
+                    "pending_offline",
+                    "User is not connected; package will be pushed when they reconnect.",
+                )
+                results.append({
+                    "user_id": user_id,
+                    "username": user["username"],
+                    "status": "pending",
+                    "sent": False,
+                    "reason_code": "pending_offline",
+                    "reason": "User is not connected; package will be pushed when they reconnect.",
+                })
+        sent_count = sum(1 for item in results if item["status"] == "sent")
+        pending_count = sum(1 for item in results if item["status"] == "pending")
+        blocked_count = sum(1 for item in results if item["status"] == "blocked")
+        failed_count = sum(1 for item in results if item["status"] == "failed")
+        return {
+            "ok": sent_count > 0 or pending_count > 0,
+            "package": package,
+            "url": tak_marti_content_url(hash_value),
+            "sent": sent_count,
+            "pending": pending_count,
+            "blocked": blocked_count,
+            "failed": failed_count,
+            "results": results,
+            "deliveries": list_datapackage_deliveries(hash_value, limit=50),
+        }
     if not send_all and not client_uids:
         raise ValueError("select at least one connected client")
     result = RELAY.send_to_client_uids(fileshare_event(package), client_uids, send_all=send_all)
@@ -2877,6 +4105,17 @@ class HttpHandler(BaseHTTPRequestHandler):
         self.send_json({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
         return None
 
+    def require_plugin_user(self):
+        user = plugin_user_for_request(self)
+        if user:
+            try:
+                learn_portal_user_device(user["id"], source_ip=self.client_address[0], device_id=self.headers.get("X-Axon-Device-Mac", ""))
+            except ValueError:
+                pass
+            return user
+        self.send_json({"error": "plugin authentication required"}, HTTPStatus.UNAUTHORIZED)
+        return None
+
     def client_cert_common_name(self):
         if hasattr(self.connection, "getpeercert"):
             try:
@@ -2887,7 +4126,13 @@ class HttpHandler(BaseHTTPRequestHandler):
 
     def authenticated_user_id(self):
         identity = client_identity_for_cert(self.client_cert_common_name())
-        return identity["user_id"] if identity else None
+        if identity:
+            try:
+                learn_portal_user_device(identity["user_id"], source_ip=self.client_address[0])
+            except ValueError:
+                pass
+            return identity["user_id"]
+        return None
 
     def do_HEAD(self):
         parsed = urlparse(self.path)
@@ -2985,6 +4230,21 @@ class HttpHandler(BaseHTTPRequestHandler):
                 return
             mark_portal_download(user["id"])
             self.send_download(package, package.name, "application/zip")
+            return
+        if path == "/api/connect/profile":
+            user = self.require_portal_auth()
+            if not user:
+                return
+            if user["first_download_at"] and not user["allow_redownload"]:
+                self.send_json({"error": "connection package already downloaded; contact your TAKlite admin for re-download or reissue"}, HTTPStatus.FORBIDDEN)
+                return
+            body = build_portal_user_plugin_config(user).encode("utf-8")
+            filename = safe_download_name("taklite-plugin.json", "taklite-plugin.json")
+            self.send_bytes(
+                body,
+                content_type="application/json",
+                extra_headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
             return
         if path in ("/Marti/api/version", "/api/version"):
             self.send_text(VERSION)
@@ -3114,6 +4374,11 @@ class HttpHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(runtime_health())
             return
+        if path == "/api/audit-events":
+            if not self.require_auth():
+                return
+            self.send_json({"items": list_audit_events(qs.get("limit", ["100"])[0], qs.get("type", [""])[0])})
+            return
         if path == "/api/settings":
             if not self.require_auth():
                 return
@@ -3132,10 +4397,90 @@ class HttpHandler(BaseHTTPRequestHandler):
         if path == "/api/ui-config":
             self.send_json({"wgDashboardUrl": WG_DASHBOARD_URL})
             return
+        if path == "/api/plugin/bootstrap/profile":
+            try:
+                device_mac = qs.get("mac", qs.get("device_mac", [self.headers.get("X-Axon-Device-Mac", "")]))[0]
+                user = find_portal_user_by_device_binding(self.client_address[0], device_mac)
+                if not user:
+                    record_audit_event(
+                        "plugin_profile_bootstrap",
+                        actor_type="device",
+                        remote=self.client_address[0],
+                        outcome="blocked",
+                        reason_code="no_matching_device_profile",
+                        details={"device_mac_supplied": bool(device_mac)},
+                    )
+                    self.send_json({"error": "no matching device profile"}, HTTPStatus.NOT_FOUND)
+                    return
+                record_audit_event(
+                    "plugin_profile_bootstrap",
+                    actor_type="portal_user",
+                    actor_id=user["id"],
+                    actor_name=user["username"],
+                    remote=self.client_address[0],
+                    outcome="ok",
+                    reason_code="profile_returned",
+                    details={"device_mac_supplied": bool(device_mac)},
+                )
+                self.send_json(json.loads(build_portal_user_plugin_config(user)))
+            except Exception as exc:
+                record_audit_event(
+                    "plugin_profile_bootstrap",
+                    actor_type="device",
+                    remote=self.client_address[0],
+                    outcome="failed",
+                    reason_code="bootstrap_error",
+                    details={"error": str(exc)},
+                )
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/plugin/me":
+            user = self.require_plugin_user()
+            if not user:
+                return
+            self.send_json(plugin_context_for_user(user))
+            return
+        if path == "/api/plugin/audience":
+            user = self.require_plugin_user()
+            if not user:
+                return
+            payload = {
+                "audience_mode": qs.get("audience_mode", qs.get("mode", ["all_allowed"]))[0],
+                "user_ids": qs.get("user_ids", qs.get("target_user_ids", [""]))[0],
+                "group_ids": qs.get("group_ids", qs.get("team_ids", [""]))[0],
+                "levels": qs.get("levels", qs.get("allowed_levels", [""]))[0],
+                "include_self": qs.get("include_self", ["false"])[0].lower() in ("1", "true", "yes", "on"),
+            }
+            result = plugin_datapackage_audience(user["id"], payload)
+            record_audit_event(
+                "plugin_audience_preview",
+                actor_type="portal_user",
+                actor_id=user["id"],
+                actor_name=user.get("username", ""),
+                remote=self.client_address[0],
+                outcome="ok",
+                reason_code="preview",
+                details={"allowed": result["allowed_count"], "blocked": result["blocked_count"], "audience": result["audience"]},
+            )
+            self.send_json(result)
+            return
         if path == "/api/datapackages":
             if not self.require_auth():
                 return
             self.send_json({"items": list_packages(enforce=False)})
+            return
+        if path == "/api/datapackages/preview":
+            if not self.require_auth():
+                return
+            try:
+                self.send_json(datapackage_access_preview(qs.get("hash", [""])[0]))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            return
+        if path == "/api/datapackages/deliveries":
+            if not self.require_auth():
+                return
+            self.send_json({"items": list_datapackage_deliveries(qs.get("hash", [""])[0], limit=100)})
             return
         if path == "/api/clients":
             if not self.require_auth():
@@ -3329,17 +4674,71 @@ class HttpHandler(BaseHTTPRequestHandler):
                 result = queue_firewall_update(self.read_json())
                 self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                 return
+            if path == "/api/plugin/datapackages/preview":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                result = plugin_datapackage_audience(user["id"], self.read_json())
+                record_audit_event(
+                    "plugin_datapackage_preview",
+                    actor_type="portal_user",
+                    actor_id=user["id"],
+                    actor_name=user.get("username", ""),
+                    remote=self.client_address[0],
+                    outcome="ok",
+                    reason_code="preview",
+                    details={"allowed": result["allowed_count"], "blocked": result["blocked_count"], "audience": result["audience"]},
+                )
+                self.send_json(result)
+                return
+            if path == "/api/plugin/datapackages/send":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                result = plugin_send_datapackage(user["id"], self.read_json())
+                self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/plugin/datapackages/upload":
+                result = plugin_upload_datapackage(self, qs)
+                if result is not None:
+                    self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+                return
             if path in ("/Marti/sync/missionupload", "/sync/missionupload"):
                 upload_datapackage_from_request(self, qs, response_url="metadata")
                 return
             if path in ("/Marti/sync/upload", "/sync/upload", "/Marti/sync/content", "/sync/content"):
                 upload_datapackage_from_request(self, qs)
                 return
+            if path == "/api/datapackages/upload":
+                if not self.require_auth():
+                    return
+                self.send_json(admin_upload_datapackage(self, qs))
+                return
             if path == "/api/datapackages/send":
                 if not self.require_auth():
                     return
                 result = send_datapackage_to_clients(self.read_json())
+                record_audit_event(
+                    "admin_datapackage_send",
+                    actor_type="admin",
+                    remote=self.client_address[0],
+                    outcome="ok" if result.get("ok") else "failed",
+                    reason_code="sent_or_queued",
+                    details={"hash": result.get("package", {}).get("Hash", ""), "sent": result.get("sent", 0), "pending": result.get("pending", 0), "blocked": result.get("blocked", 0), "failed": result.get("failed", 0)},
+                )
                 self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/datapackages/policy":
+                if not self.require_auth():
+                    return
+                payload = self.read_json()
+                result = update_datapackage_policy(
+                    payload.get("hash", ""),
+                    payload.get("mode", payload.get("policy_mode", "sender")),
+                    payload.get("allowed_levels", []),
+                    payload.get("max_level"),
+                )
+                self.send_json(result)
                 return
             if path == "/api/datapackages/delete":
                 if not self.require_auth():
@@ -3368,6 +4767,9 @@ class HttpHandler(BaseHTTPRequestHandler):
                     bool(payload.get("allow_redownload", False)),
                     payload.get("role_id"),
                     payload.get("group_ids", []),
+                    payload.get("access_level"),
+                    payload.get("assigned_ip", ""),
+                    payload.get("device_mac", ""),
                 ))
                 return
             if path == "/api/portal-users/bulk-create":
@@ -3382,6 +4784,7 @@ class HttpHandler(BaseHTTPRequestHandler):
                     absolute_base_url(self),
                     payload.get("role_id"),
                     payload.get("group_ids", []),
+                    payload.get("access_level"),
                 ))
                 return
             if path == "/api/access-roles/create":
@@ -3395,6 +4798,8 @@ class HttpHandler(BaseHTTPRequestHandler):
                     bool(payload.get("can_send_all", False)),
                     bool(payload.get("can_see_own_groups", True)),
                     bool(payload.get("can_send_own_groups", True)),
+                    bool(payload.get("can_receive_all", payload.get("can_send_all", False))),
+                    bool(payload.get("can_receive_own_groups", payload.get("can_send_own_groups", True))),
                 ))
                 return
             if path == "/api/access-roles/update":
@@ -3409,6 +4814,8 @@ class HttpHandler(BaseHTTPRequestHandler):
                     bool(payload.get("can_send_all", False)),
                     bool(payload.get("can_see_own_groups", True)),
                     bool(payload.get("can_send_own_groups", True)),
+                    bool(payload.get("can_receive_all", payload.get("can_send_all", False))),
+                    bool(payload.get("can_receive_own_groups", payload.get("can_send_own_groups", True))),
                 ))
                 return
             if path == "/api/access-roles/delete":
@@ -3439,13 +4846,14 @@ class HttpHandler(BaseHTTPRequestHandler):
                 if not self.require_auth():
                     return
                 payload = self.read_json()
-                self.send_json(set_user_access(int(payload.get("user_id", 0)), payload.get("role_id"), payload.get("group_ids", [])))
+                access_level = payload["access_level"] if "access_level" in payload else ACCESS_LEVEL_UNCHANGED
+                self.send_json(set_user_access(int(payload.get("user_id", 0)), payload.get("role_id"), payload.get("group_ids", []), access_level))
                 return
             if path == "/api/access-users/bulk-set":
                 if not self.require_auth():
                     return
                 payload = self.read_json()
-                self.send_json(bulk_set_user_access(payload.get("user_ids", []), payload.get("role_id"), payload.get("group_ids", []), payload.get("group_mode", "replace")))
+                self.send_json(bulk_set_user_access(payload.get("user_ids", []), payload.get("role_id"), payload.get("group_ids", []), payload.get("group_mode", "replace"), payload.get("access_level"), payload.get("level_mode", "unchanged")))
                 return
             if path == "/api/access-links/set":
                 if not self.require_auth():
@@ -3456,6 +4864,7 @@ class HttpHandler(BaseHTTPRequestHandler):
                     int(payload.get("target_group_id", 0)),
                     bool(payload.get("can_see", False)),
                     bool(payload.get("can_send", False)),
+                    bool(payload.get("can_receive", payload.get("can_send", False))),
                 ))
                 return
             if path == "/api/portal-users/reset-password":
@@ -3468,7 +4877,13 @@ class HttpHandler(BaseHTTPRequestHandler):
                 if not self.require_auth():
                     return
                 payload = self.read_json()
-                self.send_json(edit_portal_user(int(payload.get("id", 0)), payload.get("display_name", ""), payload.get("description", "")))
+                self.send_json(edit_portal_user(
+                    int(payload.get("id", 0)),
+                    payload.get("display_name", ""),
+                    payload.get("description", ""),
+                    payload.get("assigned_ip", ""),
+                    payload.get("device_mac", ""),
+                ))
                 return
             if path == "/api/portal-users/redownload":
                 if not self.require_auth():
@@ -3582,8 +4997,8 @@ function renderAuth(s){toolbar.innerHTML='';healthEl.textContent='login required
 function loginHtml(){return `<section class="auth"><h2>Admin Login</h2><input id="loginUser" autocomplete="username" placeholder="Username"><input id="loginPass" autocomplete="current-password" type="password" placeholder="Password"><button id="loginBtn">Log In</button></section>`}
 function setupHtml(){return `<section class="auth"><h2>First Admin Setup</h2><input id="setupToken" type="password" placeholder="Install token"><input id="setupUser" autocomplete="username" placeholder="Username"><input id="setupPass" autocomplete="new-password" type="password" placeholder="Password"><button id="setupBtn">Create Admin</button></section>`}
 function bindAuth(){const login=document.getElementById('loginBtn');if(login)login.onclick=async()=>{try{const b=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:document.getElementById('loginUser').value,password:document.getElementById('loginPass').value})}).then(async r=>{const b=await r.json();if(!r.ok)throw new Error(b.error||r.statusText);return b});session=b.session;localStorage.setItem('takliteSession',session);await load()}catch(e){statusEl.textContent=e.message}};const setup=document.getElementById('setupBtn');if(setup)setup.onclick=async()=>{try{const b=await fetch('/api/bootstrap/admin',{method:'POST',headers:{'Content-Type':'application/json','X-Admin-Token':document.getElementById('setupToken').value},body:JSON.stringify({username:document.getElementById('setupUser').value,password:document.getElementById('setupPass').value})}).then(async r=>{const b=await r.json();if(!r.ok)throw new Error(b.error||r.statusText);return b});session=b.session;localStorage.setItem('takliteSession',session);await load()}catch(e){statusEl.textContent=e.message}}}
-async function load(){try{toolbar.innerHTML='<button id="refresh">Refresh</button><button id="logout" class="secondary">Log Out</button>';document.getElementById('refresh').onclick=load;document.getElementById('logout').onclick=logout;const health=await fetch('/api/health').then(r=>r.json());healthEl.textContent=`${health.clients} clients, ${health.packages} packages`;const [packages,clients,profiles,portal]=await Promise.all([api('/api/datapackages'),api('/api/clients'),api('/api/cert-profiles'),api('/api/portal-users')]);render(packages.items||[],clients.items||[],profiles.items||[],portal.items||[],profiles.cert_password,portal.portal_url);statusEl.textContent=`Loaded ${(clients.items||[]).length} client(s), ${(packages.items||[]).length} package(s), ${(profiles.items||[]).length} connection package(s), ${(portal.items||[]).length} portal user(s).`}catch(e){if(String(e.message).includes('unauthorized')){session='';localStorage.removeItem('takliteSession');init();return}content.textContent=e.message;statusEl.textContent='Unable to load.'}}
-function render(packages,clients,profiles,portalUsers,certPassword,portalUrl){content.innerHTML=`<section class="section"><h2>Connected Clients</h2>${clientTable(clients)}</section><section class="section"><h2>Datapackages</h2>${packageTable(packages)}</section><section class="section"><h2>Connection Users</h2>${portalCreate()}${portalTable(portalUsers,portalUrl)}</section><section class="section"><h2>Connection Packages</h2>${profileCreate()}${profileTable(profiles,certPassword)}</section>`;bindActions()}
+async function load(){try{toolbar.innerHTML='<button id="refresh">Refresh</button><button id="logout" class="secondary">Log Out</button>';document.getElementById('refresh').onclick=load;document.getElementById('logout').onclick=logout;const health=await fetch('/api/health').then(r=>r.json());healthEl.textContent=`${health.clients} clients, ${health.packages} packages`;const [packages,clients,profiles,portal]=await Promise.all([api('/api/datapackages'),api('/api/clients'),api('/api/cert-profiles'),api('/api/portal-users')]);render(packages.items||[],clients.items||[],portal.items||[],portal.portal_url);statusEl.textContent=`Loaded ${(clients.items||[]).length} client(s), ${(packages.items||[]).length} package(s), ${(portal.items||[]).length} portal user(s).`}catch(e){if(String(e.message).includes('unauthorized')){session='';localStorage.removeItem('takliteSession');init();return}content.textContent=e.message;statusEl.textContent='Unable to load.'}}
+function render(packages,clients,portalUsers,portalUrl){content.innerHTML=`<section class="section"><h2>Connected Clients</h2>${clientTable(clients)}</section><section class="section"><h2>Datapackages</h2>${packageTable(packages)}</section><section class="section"><h2>Connection Users</h2>${portalCreate()}${portalTable(portalUsers,portalUrl)}</section>`;bindActions()}
 function clientTable(items){if(!items.length)return '<div class="empty">No connected clients.</div>';let rows=items.map(x=>`<tr><td>${esc(x.callsign||'Unknown')}</td><td><code>${esc(x.uid||'')}</code></td><td class="nowrap">${esc(x.ip||'')}</td><td>${esc(x.transport||'tcp')}</td><td>${esc(x.peer_cert_cn||'')}</td><td class="nowrap">${fmtUptime(x.connected_at)}</td><td>${fmtTime(x.connected_at)}</td><td>${fmtTime(x.last_seen)}</td></tr>`).join('');return `<table><thead><tr><th>Name</th><th>UID</th><th>IP</th><th>Mode</th><th>Client Cert</th><th>Uptime</th><th>Connected</th><th>Last Seen</th></tr></thead><tbody>${rows}</tbody></table>`}
 function packageTable(items){if(!items.length)return '<div class="empty">No datapackages yet.</div>';let rows=items.map(x=>`<tr><td>${esc(x.Name)}</td><td><code>${esc(x.Hash)}</code></td><td class="nowrap">${fmtBytes(x.Size)}</td><td>${esc(x.Tool||'')}</td><td>${fmtTime(x.SubmissionDateTime)}</td><td>${esc(x.CreatorUid)}</td><td><div class="actions"><a href="/Marti/sync/content?hash=${encodeURIComponent(x.Hash)}" download="${esc(x.Name)}"><button class="secondary" type="button">Download</button></a><button class="danger" data-hash="${esc(x.Hash)}">Delete</button></div></td></tr>`).join('');return `<table><thead><tr><th>Name</th><th>Hash</th><th>Size</th><th>Tool</th><th>Submitted</th><th>Creator</th><th>Action</th></tr></thead><tbody>${rows}</tbody></table>`}
 function profileCreate(){return `<div class="create"><label>Name<input id="profileName" placeholder="e.g. alpha-phone"></label><label>Description<input id="profileDesc" placeholder="Optional note"></label><button id="createProfile">Create DP.zip</button></div>`}
@@ -3625,8 +5040,9 @@ function portalHeaders(extra={}){let h={'Content-Type':'application/json',...ext
 async function portalApi(p,o={}){const r=await fetch(p,{...o,headers:{...portalHeaders(),...(o.headers||{})}});const b=await r.json();if(!r.ok)throw new Error(b.error||r.statusText);return b}
 function renderLogin(){content.innerHTML=`<h2>Download Connection Package</h2><p class="muted">Sign in after WireGuard VPN is connected.</p><label>Username</label><input id="u" autocomplete="username" value="${esc(initialUser())}"><label>Password</label><input id="p" autocomplete="current-password" type="password"><button id="login">Log In</button>`;document.getElementById('login').onclick=login}
 async function login(){try{const b=await portalApi('/api/connect/login',{method:'POST',body:JSON.stringify({username:document.getElementById('u').value,password:document.getElementById('p').value})});portalSession=b.session;localStorage.setItem('taklitePortalSession',portalSession);renderUser(b.user,b.cert_password)}catch(e){statusEl.textContent=e.message}}
-function renderUser(user,certPassword){let blocked=user.first_download_at&&!user.allow_redownload;content.innerHTML=`<h2>${esc(user.display_name||user.username)}</h2><p class="muted">Connection: <code>${esc(user.connect_string)}</code></p><p class="muted">Certificate password: <code>${esc(certPassword||'')}</code></p>${blocked?'<p>This package was already downloaded. Contact your TAKlite admin to allow another download or reissue your package.</p>':'<button id="download">Download DP.zip</button>'}<button id="logout" class="secondary">Log Out</button>`;let dl=document.getElementById('download');if(dl)dl.onclick=download;document.getElementById('logout').onclick=logout;statusEl.textContent='Ready.'}
+function renderUser(user,certPassword){let blocked=user.first_download_at&&!user.allow_redownload;content.innerHTML=`<h2>${esc(user.display_name||user.username)}</h2><p class="muted">Connection: <code>${esc(user.connect_string)}</code></p><p class="muted">Certificate password: <code>${esc(certPassword||'')}</code></p><p class="muted">The Connection Package configures ATAK/WinTAK and includes the Axon profile. Use the profile-only download only when Axon needs to be refreshed after support tells you to.</p>${blocked?'<p>This package was already downloaded. Contact your TAKlite admin to allow another download or reissue your package.</p>':'<button id="download">Download DP.zip</button><button id="downloadProfile" class="secondary">Download Axon Profile Only</button>'}<button id="logout" class="secondary">Log Out</button>`;let dl=document.getElementById('download');if(dl)dl.onclick=download;let profile=document.getElementById('downloadProfile');if(profile)profile.onclick=downloadProfile;document.getElementById('logout').onclick=logout;statusEl.textContent='Ready.'}
 async function download(){try{const r=await fetch('/api/connect/download',{headers:{'X-Portal-Token':portalSession}});if(!r.ok){let b=await r.json().catch(()=>({error:r.statusText}));throw new Error(b.error||r.statusText)}let blob=await r.blob();let name=(r.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/)?.[1]||'taklite-connection.dp.zip';let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);statusEl.textContent='Downloaded. Import the DP.zip in ATAK or WinTAK.';setTimeout(check,1000)}catch(e){statusEl.textContent=e.message}}
+async function downloadProfile(){try{const r=await fetch('/api/connect/profile',{headers:{'X-Portal-Token':portalSession}});if(!r.ok){let b=await r.json().catch(()=>({error:r.statusText}));throw new Error(b.error||r.statusText)}let blob=await r.blob();let name=(r.headers.get('Content-Disposition')||'').match(/filename="([^"]+)"/)?.[1]||'axon-profile.json';let a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),1000);statusEl.textContent='Downloaded Axon profile. Place/import it where Axon can read it, then tap Load Axon Profile.'}catch(e){statusEl.textContent=e.message}}
 async function logout(){try{await portalApi('/api/connect/logout',{method:'POST',body:'{}'})}catch(e){}portalSession='';localStorage.removeItem('taklitePortalSession');renderLogin()}
 async function check(){if(!portalSession){renderLogin();return}try{const b=await portalApi('/api/connect/me');renderUser(b.user,b.cert_password)}catch(e){portalSession='';localStorage.removeItem('taklitePortalSession');renderLogin()}}
 check();

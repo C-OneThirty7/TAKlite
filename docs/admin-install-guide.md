@@ -253,25 +253,22 @@ Admin actions:
 - Reissue: revokes the old certificate package and creates a new `.dp.zip` for the same portal user
 - Revoke: disables the portal user and revokes the certificate package
 
-## Create Standalone ATAK/WinTAK Connection Package
+## Create ATAK/WinTAK Connection Packages
 
 In the TAKlite UI:
 
-1. Open Connection Packages.
-2. Enter a package name, such as `alpha-phone`.
-3. Optionally enter a note.
-4. Click Create DP.zip.
-5. Click Download DP.zip.
+1. Open Users.
+2. Create a Connection User, or use Create Bulk Users for a group.
+3. Download the user's `.dp.zip`, or copy the portal URL/QR for the user.
+4. Give the user their portal password separately.
 
-TAKlite also shows a VPN-only download URL for each connection package, for example:
+TAKlite shows a VPN-only portal URL for each user, for example:
 
 ```text
-http://10.66.66.1:8080/connect/RANDOMTOKEN.dp.zip
+http://10.66.66.1:8080/connect/?u=alpha-phone
 ```
 
-Give that URL only to the intended VPN-connected user. Revoking the connection package disables the URL.
-
-This direct URL path is useful for quick testing, but Connection Users are preferred for normal distribution because they require a username/password and track first/last download time.
+Give that URL only to the intended VPN-connected user. Revoking or reissuing the user disables the old certificate package.
 
 The generated package contains:
 

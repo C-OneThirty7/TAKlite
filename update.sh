@@ -750,13 +750,16 @@ log "Stopping TAKlite container"
 )
 
 log "Applying release files from ${SOURCE_DIR}"
-rsync -a --delete \
-  --exclude '.git/' \
-  --exclude '.env' \
-  --exclude '/taklite/' \
-  "${SOURCE_DIR}/" "${APP_DIR}/"
+  rsync -a --delete \
+    --exclude '.git/' \
+    --exclude '.env' \
+    --exclude 'plugins/' \
+    --exclude 'docs/plugin-controlled-delivery.md' \
+    --exclude 'docs/wintak-plugin-api.md' \
+    --exclude '/taklite/' \
+    "${SOURCE_DIR}/" "${APP_DIR}/"
 
-chmod +x "${APP_DIR}/install.sh" "${APP_DIR}/smoke-test.sh" "${APP_DIR}/update.sh"
+chmod +x "${APP_DIR}/install.sh" "${APP_DIR}/smoke-test.sh" "${APP_DIR}/update.sh" "${APP_DIR}/uninstall.sh" "${APP_DIR}/reinstall.sh"
 install -d -m 700 "${APP_DIR}/taklite/data" "${APP_DIR}/taklite/certs" "${APP_DIR}/taklite/packages"
 install -d -m 770 "${APP_DIR}/taklite/data/gui-update" "${APP_DIR}/taklite/data/settings" "${APP_DIR}/taklite/data/firewall"
 chown -R 10001:10001 "${APP_DIR}/taklite/data" "${APP_DIR}/taklite/certs" "${APP_DIR}/taklite/packages"

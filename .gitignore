@@ -28,8 +28,22 @@ __pycache__/
 .mypy_cache/
 frontend/node_modules/
 frontend/dist/
+plugins/**/.gradle/
+plugins/**/build/
+plugins/**/app/build/
+plugins/**/local.properties
+plugins/**/atak-gradle-takdev.jar
+plugins/**/android_keystore
+plugins/**/main.jar
+plugins/**/*.apk
+plugins/**/*.aab
+plugins/**/*.apks
+plugins/
+docs/plugin-controlled-delivery.md
+docs/wintak-plugin-api.md
 
 # Archives and local release artifacts
+dist/
 *.zip
 *.tar
 *.tar.gz
