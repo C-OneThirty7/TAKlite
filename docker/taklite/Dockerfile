@@ -15,7 +15,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates openssl python3 qrencode \
+    && apt-get install -y --no-install-recommends ca-certificates default-jre-headless openssl python3 qrencode \
     && groupadd --system --gid 10001 taklite \
     && useradd --system --uid 10001 --gid 10001 --home-dir /app --shell /usr/sbin/nologin taklite \
     && rm -rf /var/lib/apt/lists/*

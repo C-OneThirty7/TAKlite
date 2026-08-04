@@ -140,6 +140,7 @@ function App() {
     packages: [],
     profiles: [],
     portalUsers: [],
+    enrollments: [],
     access: { roles: [], groups: [], links: [] },
     systemHealth: null,
     auditEvents: [],
@@ -165,11 +166,12 @@ function App() {
     setLoading(true);
     try {
       const health = await fetch('/api/health').then((r) => r.json());
-      const [packages, clients, profiles, portal, access, systemHealth, auditEvents] = await Promise.all([
+      const [packages, clients, profiles, portal, enrollments, access, systemHealth, auditEvents] = await Promise.all([
         api('/api/datapackages', session),
         api('/api/clients', session),
         api('/api/cert-profiles', session),
         api('/api/portal-users', session),
+        api('/api/field-enrollments', session),
         api('/api/access-control', session),
         api('/api/system-health', session),
         api('/api/audit-events?limit=25', session),
@@ -180,6 +182,7 @@ function App() {
         clients: clients.items || [],
         profiles: profiles.items || [],
         portalUsers: portal.items || [],
+        enrollments: enrollments.items || [],
         access: access || { roles: [], groups: [], links: [] },
         systemHealth,
         auditEvents: auditEvents.items || [],
@@ -215,7 +218,7 @@ function App() {
     } catch {}
     localStorage.removeItem(SESSION_KEY);
     setSession('');
-    setData({ health: null, clients: [], packages: [], profiles: [], portalUsers: [], access: { roles: [], groups: [], links: [] }, systemHealth: null, auditEvents: [], portalUrl: '', certPassword: '' });
+    setData({ health: null, clients: [], packages: [], profiles: [], portalUsers: [], enrollments: [], access: { roles: [], groups: [], links: [] }, systemHealth: null, auditEvents: [], portalUrl: '', certPassword: '' });
     await loadBootstrap();
   };
 
@@ -277,7 +280,7 @@ function App() {
         {active === 'health' && <HealthPanel health={data.systemHealth} auditEvents={data.auditEvents} />}
         {active === 'clients' && <ClientsPanel clients={data.clients} />}
         {active === 'datapackages' && <DatapackagesPanel packages={data.packages} clients={data.clients} users={data.portalUsers} session={session} load={load} setStatus={setStatus} />}
-        {active === 'users' && <UsersPanel users={data.portalUsers} access={data.access} portalUrl={data.portalUrl} certPassword={data.certPassword} session={session} load={load} setStatus={setStatus} />}
+        {active === 'users' && <UsersPanel users={data.portalUsers} enrollments={data.enrollments} access={data.access} portalUrl={data.portalUrl} certPassword={data.certPassword} session={session} load={load} setStatus={setStatus} />}
         {active === 'access' && <AccessPanel users={data.portalUsers} access={data.access} session={session} load={load} setStatus={setStatus} />}
         {active === 'firewall' && <FirewallPanel session={session} setStatus={setStatus} />}
         {active === 'settings' && <SettingsPanel health={data.systemHealth} wgUrl={wgUrl} session={session} load={load} setStatus={setStatus} />}
@@ -1405,16 +1408,19 @@ async function deleteGroup(group, session, load, setStatus) {
   await load();
 }
 
-function UsersPanel({ users, access, portalUrl, certPassword, session, load, setStatus }) {
+function UsersPanel({ users, enrollments, access, portalUrl, certPassword, session, load, setStatus }) {
   const [showBulk, setShowBulk] = useState(false);
+  const [showEnrollment, setShowEnrollment] = useState(false);
   return (
     <Panel title="Connection Users" icon={Users} wide actions={<span className="hint">Portal: <code>{portalUrl}</code> · Cert password: <code>{certPassword}</code></span>}>
       <CreateUser access={access} session={session} load={load} setStatus={setStatus} />
       <div className="panel-tools">
         <button className="btn ghost" type="button" onClick={() => setShowBulk(!showBulk)}><Users size={16} />Create Bulk Users</button>
+        <button className="btn ghost" type="button" onClick={() => setShowEnrollment(!showEnrollment)}><QrCode size={16} />Create Field Enrollment Pass</button>
         <span className="hint">Each user automatically gets a portal login, QR link, and ATAK/WinTAK DP.zip. TAKlite learns IP/device details after first connection when possible.</span>
       </div>
       {showBulk && <CreateBulkUsers access={access} session={session} load={load} setStatus={setStatus} />}
+      {showEnrollment && <FieldEnrollmentPanel enrollments={enrollments} access={access} session={session} load={load} setStatus={setStatus} />}
       <UsersTable users={users} portalUrl={portalUrl} session={session} load={load} setStatus={setStatus} />
     </Panel>
   );
@@ -1567,6 +1573,99 @@ function CreateBulkUsers({ access, session, load, setStatus }) {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+function FieldEnrollmentPanel({ enrollments, access, session, load, setStatus }) {
+  const roles = access?.roles || [];
+  const groups = access?.groups || [];
+  const [form, setForm] = useState({ name: 'Field Enrollment', username_prefix: 'field-user', description: '', expires_in_hours: 24, max_uses: 1, role_id: '', access_level: '', group_ids: [] });
+  const [busy, setBusy] = useState(false);
+  const toggleGroup = (id) => {
+    const groupIds = new Set(form.group_ids);
+    if (groupIds.has(id)) groupIds.delete(id);
+    else groupIds.add(id);
+    setForm({ ...form, group_ids: [...groupIds] });
+  };
+  const submit = async (event) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const body = await api('/api/field-enrollments/create', session, { method: 'POST', body: JSON.stringify({ ...form, role_id: form.role_id || null }) });
+      setStatus(`Field Enrollment pass created. Join Code: ${body.join_code}`);
+      await load();
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <div className="bulk-panel">
+      <form className="create-grid bulk" onSubmit={submit}>
+        <label>Pass name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Field Enrollment" /></label>
+        <label>Username prefix<input value={form.username_prefix} onChange={(e) => setForm({ ...form, username_prefix: e.target.value })} placeholder="field-user" /></label>
+        <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
+        <label>Expires in hours<input type="number" min="1" max="720" value={form.expires_in_hours} onChange={(e) => setForm({ ...form, expires_in_hours: Number(e.target.value) })} /></label>
+        <label>Max uses<input type="number" min="1" max="100" value={form.max_uses} onChange={(e) => setForm({ ...form, max_uses: Number(e.target.value) })} /></label>
+        <label>Role<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
+          <option value="">No role</option>
+          {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
+        </select></label>
+        <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
+        <button className="btn primary" type="submit" disabled={busy}><QrCode size={16} />{busy ? 'Creating...' : 'Create Pass'}</button>
+      </form>
+      {groups.length ? (
+        <div className="group-picks">
+          {groups.map((group) => (
+            <label className="check group-chip" key={group.id}>
+              <input type="checkbox" checked={form.group_ids.includes(group.id)} onChange={() => toggleGroup(group.id)} />
+              <span className="color-dot" style={{ background: group.color || '#64c18c' }} /> {group.name}
+            </label>
+          ))}
+        </div>
+      ) : null}
+      <FieldEnrollmentTable enrollments={enrollments} session={session} load={load} setStatus={setStatus} />
+    </div>
+  );
+}
+
+function FieldEnrollmentTable({ enrollments, session, load, setStatus }) {
+  if (!enrollments?.length) return <Empty title="No field enrollment passes" detail="Create a pass when a new device needs to register from the field." />;
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Pass</th>
+            <th>Status</th>
+            <th>Join</th>
+            <th>Access Defaults</th>
+            <th>Uses</th>
+            <th>Expires</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody>
+          {enrollments.map((item) => (
+            <tr key={item.id}>
+              <td><strong>{item.name}</strong><span>{item.description || item.username_prefix}</span></td>
+              <td><Badge tone={item.active ? 'good' : 'warn'}>{item.revoked ? 'revoked' : item.expired ? 'expired' : item.active ? 'active' : 'used'}</Badge></td>
+              <td><code>{item.join_code}</code><br /><code>{item.join_url || `${location.origin}${item.join_path}`}</code></td>
+              <td><span>Role {item.role_id || 'none'}</span><span>Level {item.access_level || 'none'}</span><span>{(item.group_ids || []).length} group(s)</span></td>
+              <td>{item.used_count || 0} / {item.max_uses || 0}</td>
+              <td>{fmtTime(item.expires_at)}</td>
+              <td>
+                <div className="row-actions">
+                  <button className="icon-btn" title="Copy Join Code" onClick={() => copyText(item.join_code, setStatus)}><Copy size={15} /></button>
+                  <button className="icon-btn" title="Copy enrollment URL" onClick={() => copyText(item.join_url || `${location.origin}${item.join_path}`, setStatus)}><Link2 size={15} /></button>
+                  <button className="icon-btn" title="QR" onClick={() => showEnrollmentQr(item.id, session, setStatus)}><QrCode size={15} /></button>
+                  <button className="icon-btn danger" title="Revoke" disabled={item.revoked} onClick={() => revokeEnrollment(item, session, load, setStatus)}><XCircle size={15} /></button>
+                </div>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -2198,6 +2297,25 @@ async function showQr(id, session, setStatus) {
   const win = window.open('', 'takliteQr', 'width=420,height=470');
   win.document.write(`<title>TAKlite QR</title><body style="margin:0;background:#101814;color:#e6eee8;font-family:system-ui;text-align:center;padding:24px"><h2>Connection Portal</h2><img src="${url}" style="width:320px;height:320px;background:white;padding:12px;border-radius:16px"><p>Scan after VPN is connected.</p></body>`);
   setStatus('QR opened.');
+}
+
+async function showEnrollmentQr(id, session, setStatus) {
+  const response = await fetch(`/api/field-enrollments/qr?id=${encodeURIComponent(id)}`, { headers: authHeaders(session, {}) });
+  if (!response.ok) {
+    const body = await response.json().catch(() => ({ error: response.statusText }));
+    throw new Error(body.error || response.statusText);
+  }
+  const url = URL.createObjectURL(await response.blob());
+  const win = window.open('', 'takliteEnrollmentQr', 'width=420,height=500');
+  win.document.write(`<title>Field Enrollment QR</title><body style="margin:0;background:#101814;color:#e6eee8;font-family:system-ui;text-align:center;padding:24px"><h2>Field Enrollment</h2><img src="${url}" style="width:320px;height:320px;background:white;padding:12px;border-radius:16px"><p>Scan this to copy the Join Code and server URL into Axon.</p></body>`);
+  setStatus('Field Enrollment QR opened.');
+}
+
+async function revokeEnrollment(item, session, load, setStatus) {
+  if (!confirm(`Revoke Field Enrollment pass ${item.name}?`)) return;
+  await api('/api/field-enrollments/revoke', session, { method: 'POST', body: JSON.stringify({ id: item.id }) });
+  setStatus('Field Enrollment pass revoked.');
+  await load();
 }
 
 async function resetUser(user, session, load, setStatus) {

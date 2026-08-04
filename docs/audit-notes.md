@@ -60,6 +60,8 @@ TAKlite is a VPN-first relay and datapackage service. The intended public VPS ex
 - Rework roles, groups, and policy links into a guided bulk workflow. The current access UI is powerful but too button-heavy and confusing for normal admin use.
 - Add a live map view showing connected clients, latest PLI, recent CoT markers, chat, routes, drawings, and polygons.
 - Add CoT event browser/search for troubleshooting received XML without requiring shell access.
+- Add Axon admin mode or a separate admin plugin for authorized EUDs: server health, user lookup, profile reissue, field device registration, remote user revoke, role/group/level changes, package queue review, and diagnostics upload without shell access.
+- Add role-gated Axon PLI sharing control for trusted users who need to temporarily stop sending their own location. Axon can toggle ATAK's local self-location dispatch when available, but TAKlite must also enforce the final relay-side allow/block decision so native ATAK settings or user misconfiguration cannot bypass policy.
 
 ## Validation Checklist
 

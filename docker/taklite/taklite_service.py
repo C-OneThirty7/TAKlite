@@ -60,6 +60,7 @@ MAX_ZIP_ENTRIES = int(os.environ.get("TAKLITE_MAX_ZIP_ENTRIES", "1000"))
 MAX_ZIP_UNCOMPRESSED_BYTES = int(os.environ.get("TAKLITE_MAX_ZIP_UNCOMPRESSED_BYTES", str(512 * 1024 * 1024)))
 MAX_ZIP_COMPRESSION_RATIO = int(os.environ.get("TAKLITE_MAX_ZIP_COMPRESSION_RATIO", "100"))
 MAX_JSON_BYTES = int(os.environ.get("TAKLITE_MAX_JSON_BYTES", str(256 * 1024)))
+MAX_FIELD_ENROLLMENT_HOURS = int(os.environ.get("TAKLITE_MAX_FIELD_ENROLLMENT_HOURS", "720"))
 COT_MAX_BUFFER_BYTES = int(os.environ.get("TAKLITE_COT_MAX_BUFFER_BYTES", str(1024 * 1024)))
 EVENT_RETENTION_ROWS = int(os.environ.get("TAKLITE_EVENT_RETENTION_ROWS", "50000"))
 COT_TLS_REQUIRE_CLIENT_CERT = os.environ.get("TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT", "true").lower() in ("1", "true", "yes", "on")
@@ -99,6 +100,7 @@ FIREWALL_STATES = {"public", "vpn", "closed"}
 EVENT_END = b"</event>"
 EVENT_RE = re.compile(rb"<event\b.*?</event>", re.DOTALL)
 UID_RE = re.compile(rb'\buid="([^"]+)"')
+TYPE_RE = re.compile(rb'\btype="([^"]+)"')
 CALLSIGN_RE = re.compile(rb'<contact\b[^>]*\bcallsign="([^"]+)"')
 EVENT_SAVE_COUNT = 0
 LOGIN_FAILURES = {}
@@ -110,6 +112,16 @@ ACCESS_LEVEL_UNCHANGED = object()
 
 def utc_now():
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_time(value):
+    try:
+        parsed = datetime.fromisoformat((value or "").replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)
+    except Exception:
+        return datetime.fromtimestamp(0, tz=timezone.utc)
 
 
 def new_plugin_token():
@@ -221,6 +233,7 @@ def init_db():
                 assigned_ip text,
                 device_mac text,
                 cert_profile_id integer not null,
+                pli_enabled integer not null default 1,
                 allow_redownload integer not null default 0,
                 first_download_at text,
                 last_download_at text,
@@ -323,6 +336,24 @@ def init_db():
                 details text
             )
         """)
+        conn.execute("""
+            create table if not exists field_enrollments (
+                id integer primary key autoincrement,
+                name text not null,
+                token text not null unique,
+                username_prefix text not null,
+                description text,
+                role_id integer,
+                access_level integer,
+                group_ids text not null default '[]',
+                max_uses integer not null default 1,
+                used_count integer not null default 0,
+                expires_at text not null,
+                created_at text not null,
+                revoked_at text,
+                foreign key(role_id) references access_roles(id) on delete set null
+            )
+        """)
         columns = {row["name"] for row in conn.execute("pragma table_info(cert_profiles)").fetchall()}
         if "download_token" not in columns:
             conn.execute("alter table cert_profiles add column download_token text")
@@ -339,6 +370,8 @@ def init_db():
             conn.execute("alter table portal_users add column assigned_ip text")
         if "device_mac" not in portal_columns:
             conn.execute("alter table portal_users add column device_mac text")
+        if "pli_enabled" not in portal_columns:
+            conn.execute("alter table portal_users add column pli_enabled integer not null default 1")
         for row in conn.execute("select id from portal_users where plugin_api_token is null or plugin_api_token = ''").fetchall():
             conn.execute("update portal_users set plugin_api_token = ? where id = ?", (new_plugin_token(), row["id"]))
         admin_columns = {row["name"] for row in conn.execute("pragma table_info(admins)").fetchall()}
@@ -379,6 +412,8 @@ def init_db():
         conn.execute("create index if not exists idx_access_user_groups_group on access_user_groups(group_id)")
         conn.execute("create index if not exists idx_audit_events_time on audit_events(occurred_at)")
         conn.execute("create index if not exists idx_audit_events_type on audit_events(event_type)")
+        conn.execute("create index if not exists idx_field_enrollments_token on field_enrollments(token)")
+        conn.execute("create index if not exists idx_field_enrollments_expires on field_enrollments(expires_at)")
         conn.commit()
 
 
@@ -695,6 +730,25 @@ def save_event(data, remote, user_id=None):
         RELAY.update_client(remote, uid, callsign, user_id=user_id)
     if uid:
         RELAY.remember_event(uid, data, user_id)
+
+
+def is_pli_event(data):
+    event_type = decode_match(TYPE_RE.search(data)).strip().lower()
+    if not event_type:
+        return False
+    if event_type.startswith(("b-f", "t-x", "t-k", "t-s", "t-r")):
+        return False
+    if not event_type.startswith("a-"):
+        return False
+    return b"<point " in data and b"<contact" in data and (b"<track" in data or b"<precisionlocation" in data)
+
+
+def user_pli_enabled(user_id):
+    if not user_id:
+        return True
+    with db_connect() as conn:
+        row = conn.execute("select pli_enabled from portal_users where id = ?", (int(user_id),)).fetchone()
+    return bool(not row or row["pli_enabled"])
 
 
 def decode_match(match):
@@ -1305,28 +1359,40 @@ def subject_policy(user_id):
 
 
 def can_subject_action(viewer_id, target_id, action):
+    return explain_subject_action(viewer_id, target_id, action)["allowed"]
+
+
+def explain_subject_action(viewer_id, target_id, action):
     if int(viewer_id) == int(target_id):
-        return True
+        return {"allowed": True, "reason_code": "self", "reason": "Same user."}
     viewer = subject_policy(viewer_id)
     target = subject_policy(target_id)
     if not viewer or not target:
-        return False
+        return {"allowed": False, "reason_code": "missing_user", "reason": "Source or target user is missing or revoked."}
     if not access_policy_active():
-        return True
+        return {"allowed": True, "reason_code": "open_default", "reason": "No access policy is assigned; users can interact by default."}
     if viewer[f"can_{action}_all"]:
-        return True
+        return {"allowed": True, "reason_code": f"{action}_all", "reason": f"Source role can {action} all users."}
     def level_allowed():
         if action == "receive":
-            return True
+            return (True, "level_not_applied", "Receive permission is controlled by recipient policy.")
         viewer_level = viewer.get("access_level")
         target_level = target.get("access_level")
         if viewer_level is None or target_level is None:
-            return True
-        return int(viewer_level) >= int(target_level)
+            return (True, "level_open", "One or both users have no access level; level filter does not block.")
+        allowed = int(viewer_level) >= int(target_level)
+        return (
+            allowed,
+            "level_allowed" if allowed else "level_blocked",
+            f"Source level {viewer_level} {'meets' if allowed else 'is below'} target level {target_level}.",
+        )
     if viewer[f"can_{action}_own_groups"] and viewer["groups"] & target["groups"]:
-        return level_allowed()
+        allowed, level_code, level_reason = level_allowed()
+        if allowed:
+            return {"allowed": True, "reason_code": f"own_group_{action}", "reason": f"Users share a team. {level_reason}"}
+        return {"allowed": False, "reason_code": level_code, "reason": level_reason}
     if not viewer["groups"] or not target["groups"]:
-        return False
+        return {"allowed": False, "reason_code": "missing_group", "reason": "Source or target has no team membership for this policy path."}
     column = f"can_{action}"
     with db_connect() as conn:
         source_groups = target["groups"] if action == "receive" else viewer["groups"]
@@ -1342,7 +1408,12 @@ def can_subject_action(viewer_id, target_id, action):
               and {column} = 1
             limit 1
         """, params).fetchone()
-    return bool(row) and level_allowed()
+    if not row:
+        return {"allowed": False, "reason_code": f"no_group_link_{action}", "reason": f"No team link allows this {action} path."}
+    allowed, level_code, level_reason = level_allowed()
+    if allowed:
+        return {"allowed": True, "reason_code": f"group_link_{action}", "reason": f"A team link allows this {action} path. {level_reason}"}
+    return {"allowed": False, "reason_code": level_code, "reason": level_reason}
 
 
 def can_subject_see(viewer_id, target_id):
@@ -1524,6 +1595,8 @@ def plugin_context_for_user(user):
             "can_see_own_groups": bool(policy.get("can_see_own_groups")),
             "can_send_own_groups": bool(policy.get("can_send_own_groups")),
             "can_receive_own_groups": bool(policy.get("can_receive_own_groups")),
+            "can_manage_users": plugin_user_can_create_field_enrollment(user),
+            "can_toggle_pli": bool(policy.get("can_see_all") or policy.get("can_send_all") or policy.get("can_receive_all") or user.get("access_level")),
         },
         "access": {
             "policy_active": access_policy_active(),
@@ -1571,6 +1644,125 @@ def plugin_context_for_user(user):
             for item in users
         ],
     }
+
+
+def plugin_user_can_create_field_enrollment(user):
+    user = attach_access_to_users([user])[0]
+    policy = subject_policy(user["id"]) or {}
+    level = user.get("access_level")
+    try:
+        level = int(level) if level is not None else 0
+    except (TypeError, ValueError):
+        level = 0
+    return bool(
+        (policy.get("can_see_all") and policy.get("can_send_all") and policy.get("can_receive_all"))
+        or (level >= 4 and (policy.get("can_see_all") or policy.get("can_send_all") or policy.get("can_receive_all")))
+    )
+
+
+def require_plugin_manager(user):
+    if not plugin_user_can_create_field_enrollment(user):
+        raise ValueError("this Axon profile cannot manage users")
+
+
+def plugin_admin_snapshot(user):
+    require_plugin_manager(user)
+    return {
+        "ok": True,
+        "users": list_portal_users(),
+        "clients": RELAY.snapshot(),
+        "access": access_summary(),
+    }
+
+
+def plugin_revoke_user(actor, user_id):
+    require_plugin_manager(actor)
+    user_id = int(user_id or 0)
+    if int(actor["id"]) == user_id:
+        raise ValueError("cannot revoke the current Axon profile from the plugin")
+    return {"ok": True, "user": revoke_portal_user(user_id)}
+
+
+def plugin_reissue_user(actor, user_id):
+    require_plugin_manager(actor)
+    user_id = int(user_id or 0)
+    if int(actor["id"]) == user_id:
+        raise ValueError("cannot reissue the current Axon profile from the plugin")
+    return {"ok": True, "user": reissue_portal_user(user_id)}
+
+
+def set_user_pli_enabled(actor, user_id, enabled):
+    user_id = int(user_id or 0)
+    if int(actor["id"]) != user_id and not plugin_user_can_create_field_enrollment(actor):
+        raise ValueError("this Axon profile cannot change another user's PLI setting")
+    with db_connect() as conn:
+        row = conn.execute("select id from portal_users where id = ? and revoked_at is null", (user_id,)).fetchone()
+        if not row:
+            raise ValueError("portal user not found")
+        conn.execute("update portal_users set pli_enabled = ? where id = ?", (1 if enabled else 0, user_id))
+        conn.commit()
+    return {"ok": True, "user": attach_access_to_users([portal_user_row(find_portal_user(user_id))])[0]}
+
+
+def plugin_policy_test(actor, source_user_id, target_user_id):
+    require_plugin_manager(actor)
+    source_user_id = int(source_user_id or 0)
+    target_user_id = int(target_user_id or 0)
+    source = find_portal_user(source_user_id)
+    target = find_portal_user(target_user_id)
+    if not source or not target:
+        raise ValueError("source or target user not found")
+    source_see = explain_subject_action(source_user_id, target_user_id, "see")
+    source_send = explain_subject_action(source_user_id, target_user_id, "send")
+    target_receive = explain_subject_action(target_user_id, source_user_id, "receive")
+    target_see = explain_subject_action(target_user_id, source_user_id, "see")
+    target_send = explain_subject_action(target_user_id, source_user_id, "send")
+    source_receive = explain_subject_action(source_user_id, target_user_id, "receive")
+    return {
+        "ok": True,
+        "source": attach_access_to_users([portal_user_row(source)])[0],
+        "target": attach_access_to_users([portal_user_row(target)])[0],
+        "can_see_pli": source_see["allowed"],
+        "can_send_package": source_send["allowed"],
+        "can_receive_package": target_receive["allowed"],
+        "target_can_see_source": target_see["allowed"],
+        "target_can_send_source": target_send["allowed"],
+        "source_can_receive_target": source_receive["allowed"],
+        "reasons": {
+            "source_see": source_see,
+            "source_send": source_send,
+            "target_receive": target_receive,
+            "target_see": target_see,
+            "target_send": target_send,
+            "source_receive": source_receive,
+        },
+    }
+
+
+def plugin_create_field_enrollment(user, payload, base_url):
+    if not plugin_user_can_create_field_enrollment(user):
+        raise ValueError("this Axon profile cannot create Field Registration passes")
+    item = create_field_enrollment(
+        payload.get("name", "Field Registration"),
+        payload.get("username_prefix", "field-user"),
+        payload.get("description", ""),
+        payload.get("expires_in_hours", 24),
+        payload.get("max_uses", 1),
+        payload.get("role_id"),
+        payload.get("group_ids", []),
+        payload.get("access_level"),
+        base_url,
+    )
+    record_audit_event(
+        "plugin_field_enrollment_created",
+        actor_type="portal_user",
+        actor_id=user["id"],
+        actor_name=user.get("username", ""),
+        outcome="ok",
+        reason_code="created",
+        details={"id": item.get("id"), "name": item.get("name"), "max_uses": item.get("max_uses")},
+    )
+    return item
 
 
 def plugin_audience_filter(sender, target, payload):
@@ -1665,6 +1857,62 @@ def plugin_datapackage_audience(sender_user_id, payload):
         "blocked_count": sum(1 for item in results if not item["allowed"]),
         "items": results,
     }
+
+
+def plugin_datapackage_history(user_id, limit=25):
+    user_id = int(user_id)
+    limit = max(1, min(int(limit or 25), 100))
+    with db_connect() as conn:
+        rows = conn.execute("""
+            select distinct p.*
+            from datapackages p
+            left join datapackage_recipients r on r.package_hash = p.Hash
+            left join datapackage_deliveries d on d.package_hash = p.Hash
+            where p.CreatorUserId = ?
+               or r.target_user_id = ?
+               or d.target_user_id = ?
+            order by p.PrimaryKey desc
+            limit ?
+        """, (user_id, user_id, user_id, limit)).fetchall()
+
+        items = []
+        for row in rows:
+            package = row_to_package(row)
+            deliveries = conn.execute("""
+                select d.*, u.username, u.display_name
+                from datapackage_deliveries d
+                left join portal_users u on u.id = d.target_user_id
+                where d.package_hash = ?
+                order by d.id desc
+                limit 20
+            """, (package["Hash"],)).fetchall()
+            delivery_items = []
+            sent = pending = blocked = failed = 0
+            for delivery in deliveries:
+                item = delivery_row(delivery)
+                item["username"] = delivery["username"] or ""
+                item["display_name"] = delivery["display_name"] or ""
+                delivery_items.append(item)
+                status = item["status"]
+                if status == "sent":
+                    sent += 1
+                elif status == "pending":
+                    pending += 1
+                elif status == "blocked":
+                    blocked += 1
+                elif status == "failed":
+                    failed += 1
+            direction = "outbox" if package.get("CreatorUserId") == user_id else "inbox"
+            items.append({
+                "package": package,
+                "direction": direction,
+                "sent": sent,
+                "pending": pending,
+                "blocked": blocked,
+                "failed": failed,
+                "deliveries": delivery_items,
+            })
+    return {"ok": True, "items": items}
 
 
 def plugin_upload_datapackage(handler, qs):
@@ -1804,18 +2052,14 @@ def marti_groups_response():
 def client_endpoints_response():
     endpoints = []
     for info in RELAY.snapshot():
+        last_seen = info.get("last_seen") or info.get("connected_at") or utc_now()
         endpoints.append({
-            **info,
             "uid": info.get("uid", ""),
             "callsign": info.get("callsign", ""),
-            "address": info.get("ip", ""),
-            "port": info.get("port", 0),
-            "transport": info.get("transport", ""),
-            "username": info.get("username", "") or info.get("peer_cert_cn", ""),
-            "lastEventTime": info.get("last_seen", ""),
-            "connectionTime": info.get("connected_at", ""),
+            "lastStatus": "Connected",
+            "lastEventTime": marti_timestamp(last_seen),
         })
-    return {"version": 3, "type": "ClientEndpointList", "data": endpoints}
+    return {"version": 3, "type": "com.bbn.marti.remote.ClientEndpoint", "data": endpoints}
 
 
 def mission_empty_response(kind="MissionList"):
@@ -1859,6 +2103,228 @@ def build_bulk_usernames(prefix, count):
 
 def generate_portal_password(length=12):
     return "".join(secrets.choice(BULK_PASSWORD_ALPHABET) for _ in range(length))
+
+
+def new_enrollment_token():
+    return f"axj_{secrets.token_urlsafe(24)}"
+
+
+def validate_username_prefix(prefix):
+    prefix = (prefix or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{3,48}", prefix):
+        raise ValueError("username prefix must be 3-48 characters: letters, numbers, dot, underscore, dash, or @")
+    return prefix
+
+
+def validate_enrollment_hours(value):
+    try:
+        hours = int(value or 24)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"field enrollment expiration must be 1-{MAX_FIELD_ENROLLMENT_HOURS} hours") from exc
+    if hours < 1 or hours > MAX_FIELD_ENROLLMENT_HOURS:
+        raise ValueError(f"field enrollment expiration must be 1-{MAX_FIELD_ENROLLMENT_HOURS} hours")
+    return hours
+
+
+def validate_enrollment_uses(value):
+    try:
+        uses = int(value or 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("field enrollment max uses must be 1-100") from exc
+    if uses < 1 or uses > 100:
+        raise ValueError("field enrollment max uses must be 1-100")
+    return uses
+
+
+def validate_enrollment_token(token):
+    token = (token or "").strip()
+    if token.startswith("axon-enroll://") or token.startswith("http://") or token.startswith("https://"):
+        parsed = urlparse(token)
+        params = parse_qs(parsed.query)
+        token = (params.get("code") or params.get("token") or [""])[0]
+    if not re.fullmatch(r"axj_[A-Za-z0-9_-]{20,100}", token):
+        raise ValueError("field enrollment join code is invalid")
+    return token
+
+
+def parse_json_int_list(value):
+    if not value:
+        return []
+    try:
+        loaded = json.loads(value)
+    except Exception:
+        loaded = []
+    return parse_int_list(loaded)
+
+
+def unique_portal_username(prefix, preferred=""):
+    candidates = []
+    if preferred:
+        safe_preferred = re.sub(r"[^A-Za-z0-9_.@-]+", "-", preferred.strip()).strip(".-")
+        if len(safe_preferred) >= 3:
+            candidates.append(safe_preferred[:64])
+    candidates.append(prefix[:64])
+    for base in candidates:
+        try:
+            base = validate_portal_username(base)
+        except ValueError:
+            continue
+        for idx in range(0, 1000):
+            suffix = "" if idx == 0 else f"-{idx + 1}"
+            candidate = validate_portal_username(f"{base[:64 - len(suffix)]}{suffix}")
+            with db_connect() as conn:
+                user_exists = conn.execute("select 1 from portal_users where username = ?", (candidate,)).fetchone()
+                profile_exists = conn.execute("select 1 from cert_profiles where name = ?", (candidate,)).fetchone()
+            if not user_exists and not profile_exists:
+                return candidate
+    raise ValueError("could not allocate a unique username for field enrollment")
+
+
+def enrollment_row(row, base_url=""):
+    group_ids = parse_json_int_list(row["group_ids"])
+    item = {
+        "id": row["id"],
+        "name": row["name"],
+        "token": row["token"],
+        "join_code": row["token"],
+        "username_prefix": row["username_prefix"],
+        "description": row["description"] or "",
+        "role_id": row["role_id"],
+        "access_level": row["access_level"],
+        "group_ids": group_ids,
+        "max_uses": row["max_uses"],
+        "used_count": row["used_count"],
+        "remaining_uses": max(0, int(row["max_uses"] or 0) - int(row["used_count"] or 0)),
+        "expires_at": row["expires_at"],
+        "created_at": row["created_at"],
+        "revoked_at": row["revoked_at"] or "",
+        "revoked": bool(row["revoked_at"]),
+        "expired": parse_time(row["expires_at"]) <= datetime.now(timezone.utc),
+    }
+    item["active"] = not item["revoked"] and not item["expired"] and item["remaining_uses"] > 0
+    item["join_path"] = f"/connect/enroll?code={quote(item['token'])}"
+    item["axon_uri"] = f"axon://field-enroll?code={quote(item['token'])}"
+    if base_url:
+        item["join_url"] = f"{base_url}{item['join_path']}"
+        item["axon_uri"] = f"axon://field-enroll?server={quote(base_url, safe='')}&code={quote(item['token'])}"
+    return item
+
+
+def list_field_enrollments(base_url=""):
+    with db_connect() as conn:
+        rows = conn.execute("select * from field_enrollments order by id desc").fetchall()
+    return [enrollment_row(row, base_url) for row in rows]
+
+
+def find_field_enrollment(enrollment_id):
+    with db_connect() as conn:
+        return conn.execute("select * from field_enrollments where id = ?", (int(enrollment_id or 0),)).fetchone()
+
+
+def find_field_enrollment_by_token(token):
+    token = validate_enrollment_token(token)
+    with db_connect() as conn:
+        return conn.execute("select * from field_enrollments where token = ?", (token,)).fetchone()
+
+
+def create_field_enrollment(name, username_prefix, description="", expires_in_hours=24, max_uses=1, role_id=None, group_ids=None, access_level=None, base_url=""):
+    name = validate_access_name(name or "Field Enrollment", "field enrollment name")
+    username_prefix = validate_username_prefix(username_prefix or "field-user")
+    expires_in_hours = validate_enrollment_hours(expires_in_hours)
+    max_uses = validate_enrollment_uses(max_uses)
+    access_level = validate_access_level(access_level)
+    group_ids = [int(value) for value in (group_ids or []) if str(value).strip()]
+    role_id = int(role_id or 0) or None
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=expires_in_hours)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    token = new_enrollment_token()
+    with db_connect() as conn:
+        if role_id and not conn.execute("select id from access_roles where id = ?", (role_id,)).fetchone():
+            raise ValueError("role not found")
+        if group_ids:
+            placeholders = ",".join("?" for _ in group_ids)
+            found = {row["id"] for row in conn.execute(f"select id from access_groups where id in ({placeholders})", group_ids).fetchall()}
+            missing = sorted(set(group_ids) - found)
+            if missing:
+                raise ValueError(f"group not found: {missing[0]}")
+        conn.execute("""
+            insert into field_enrollments
+              (name, token, username_prefix, description, role_id, access_level, group_ids, max_uses, used_count, expires_at, created_at, revoked_at)
+            values (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, null)
+        """, (name, token, username_prefix, (description or "").strip(), role_id, access_level, json.dumps(group_ids), max_uses, expires_at, utc_now()))
+        conn.commit()
+        row = conn.execute("select * from field_enrollments where token = ?", (token,)).fetchone()
+    return enrollment_row(row, base_url)
+
+
+def revoke_field_enrollment(enrollment_id):
+    with db_connect() as conn:
+        row = conn.execute("select * from field_enrollments where id = ?", (int(enrollment_id or 0),)).fetchone()
+        if not row:
+            raise ValueError("field enrollment pass not found")
+        conn.execute("update field_enrollments set revoked_at = coalesce(revoked_at, ?) where id = ?", (utc_now(), row["id"]))
+        conn.commit()
+        row = conn.execute("select * from field_enrollments where id = ?", (row["id"],)).fetchone()
+    return enrollment_row(row)
+
+
+def redeem_field_enrollment(token, source_ip="", device_id="", display_name="", base_url=""):
+    token = validate_enrollment_token(token)
+    source_ip = validate_assigned_ip(source_ip)
+    device_id = validate_device_mac(device_id)
+    now = datetime.now(timezone.utc)
+    with db_connect() as conn:
+        row = conn.execute("select * from field_enrollments where token = ?", (token,)).fetchone()
+        if not row:
+            raise ValueError("field enrollment pass not found")
+        info = enrollment_row(row, base_url)
+        if info["revoked"]:
+            raise ValueError("field enrollment pass has been revoked")
+        if info["expired"]:
+            raise ValueError("field enrollment pass has expired")
+        if info["remaining_uses"] <= 0:
+            raise ValueError("field enrollment pass has no remaining uses")
+        conn.execute("update field_enrollments set used_count = used_count + 1 where id = ?", (row["id"],))
+        conn.commit()
+
+    username = unique_portal_username(row["username_prefix"], display_name)
+    password = generate_portal_password(16)
+    user = create_portal_user(
+        username,
+        password,
+        display_name or username,
+        row["description"] or f"Field enrollment {row['name']}",
+        True,
+        row["role_id"],
+        parse_json_int_list(row["group_ids"]),
+        row["access_level"],
+        source_ip,
+        device_id,
+    )
+    user_with_token = portal_user_row(find_portal_user(user["id"]), include_plugin_token=True)
+    profile = json.loads(build_portal_user_plugin_config(user_with_token))
+    cert_profile = find_cert_profile(user["cert_profile_id"])
+    package_path_value = cert_profile_row(cert_profile)["public_download_path"] if cert_profile else ""
+    user_public = attach_access_to_users([portal_user_row(find_portal_user(user["id"]))])[0]
+    result = {
+        "ok": True,
+        "message": "field enrollment complete",
+        "user": user_public,
+        "profile": profile,
+        "portal_password": password,
+        "connection_package_url": f"{base_url}{package_path_value}" if base_url and package_path_value else package_path_value,
+        "portal_url": f"{base_url}{user['portal_path']}" if base_url else user["portal_path"],
+    }
+    record_audit_event(
+        "field_enrollment_redeemed",
+        actor_type="portal_user",
+        actor_id=user["id"],
+        actor_name=user["username"],
+        remote=source_ip,
+        outcome="ok",
+        reason_code="redeemed",
+        details={"enrollment": row["name"], "device_id_supplied": bool(device_id)},
+    )
+    return result
 
 
 def ensure_bulk_users_available(usernames):
@@ -1913,13 +2379,23 @@ def unique_profile_name(base):
     return f"{base}-{secrets.token_hex(3)}"
 
 
-def portal_user_row(row):
+def row_get(row, key, default=""):
+    try:
+        if key in row.keys():
+            return row[key]
+    except AttributeError:
+        if isinstance(row, dict):
+            return row.get(key, default)
+    return default
+
+
+def portal_user_row(row, include_plugin_token=False):
     profile = row["profile_name"] or ""
     revoked = bool(row["revoked_at"] or row["profile_revoked_at"])
     username = row["username"]
     role_id = row["role_id"] if "role_id" in row.keys() else None
     access_level = row["access_level"] if "access_level" in row.keys() else None
-    return {
+    item = {
         "id": row["id"],
         "username": username,
         "display_name": row["display_name"] or "",
@@ -1927,7 +2403,6 @@ def portal_user_row(row):
         "assigned_ip": row["assigned_ip"] if "assigned_ip" in row.keys() and row["assigned_ip"] else "",
         "device_mac": row["device_mac"] if "device_mac" in row.keys() and row["device_mac"] else "",
         "cert_profile_id": row["cert_profile_id"],
-        "plugin_api_token": row["plugin_api_token"] if "plugin_api_token" in row.keys() else "",
         "profile_name": profile,
         "connect_string": row["connect_string"] or "",
         "allow_redownload": bool(row["allow_redownload"]),
@@ -1939,12 +2414,16 @@ def portal_user_row(row):
         "revoked": revoked,
         "role_id": role_id,
         "access_level": access_level,
+        "pli_enabled": bool(row_get(row, "pli_enabled", 1)),
         "role_name": "",
         "groups": [],
         "group_ids": [],
         "portal_path": f"/connect/?u={quote(username)}",
         "qr_path": f"/api/portal-users/qr?id={row['id']}",
     }
+    if include_plugin_token:
+        item["plugin_api_token"] = row_get(row, "plugin_api_token", "") or ""
+    return item
 
 
 def attach_access_to_users(items):
@@ -2341,16 +2820,17 @@ def package_access_for_user(package, user_id, enforce=None):
     if not enforce:
         result.update({"allowed": True, "reason_code": "allowed_enforcement_off", "reason": "Access enforcement is off."})
         return result
+    is_public = visibility == "public" or tool == "public"
     if not user_id:
-        if visibility == "public" or tool == "public":
+        if is_public and not creator_user_id:
             result.update({"allowed": True, "reason_code": "allowed_public", "reason": "Public package."})
         else:
-            result.update({"reason_code": "blocked_no_identity", "reason": "Client certificate identity is required for private packages."})
+            result.update({"reason_code": "blocked_no_identity", "reason": "Client certificate identity is required for this package."})
         return result
     if not access_policy_active():
         result.update({"allowed": True, "reason_code": "allowed_open_default", "reason": "No access policy is assigned; server is in open default mode."})
         return result
-    if visibility == "public":
+    if is_public and not creator_user_id:
         result.update({"allowed": True, "reason_code": "allowed_public", "reason": "Public package."})
         return result
     if not creator_user_id:
@@ -2585,13 +3065,83 @@ P12_KEY_COMPAT_ARGS = [
 ]
 
 
-def subject_alt_name_for_host(host):
-    host = (host or "127.0.0.1").strip()
-    if re.fullmatch(r"(?:\d{1,3}\.){3}\d{1,3}", host):
-        return f"IP:{host}"
-    if ":" in host:
-        return f"IP:{host}"
-    return f"DNS:{host}"
+def cert_host_kind(host):
+    host = (host or "").strip()
+    try:
+        ipaddress.ip_address(host)
+        return "IP"
+    except ValueError:
+        return "DNS"
+
+
+def tls_server_hosts():
+    hosts = [
+        SERVER_HOST,
+        PUBLIC_HOST,
+        "localhost",
+        "127.0.0.1",
+        "taklite.local",
+    ]
+    seen = set()
+    result = []
+    for host in hosts:
+        host = (host or "").strip()
+        if not host or host in ("0.0.0.0", "::"):
+            continue
+        key = host.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(host)
+    return result or ["127.0.0.1", "localhost"]
+
+
+def subject_alt_name_for_hosts(hosts):
+    entries = []
+    seen = set()
+    for host in hosts:
+        kind = cert_host_kind(host)
+        value = f"{kind}:{host}"
+        key = value.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append(value)
+    return ",".join(entries)
+
+
+def cert_identity_set_from_text(text):
+    identities = set()
+    for value in re.findall(r"IP Address:([^,\n]+)", text or ""):
+        identities.add(("IP", value.strip()))
+    for value in re.findall(r"DNS:([^,\n]+)", text or ""):
+        identities.add(("DNS", value.strip().lower()))
+    subject_match = re.search(r"subject=.*?CN\s*=\s*([^,\n/]+)", text or "")
+    if subject_match:
+        cn = subject_match.group(1).strip()
+        identities.add((cert_host_kind(cn), cn if cert_host_kind(cn) == "IP" else cn.lower()))
+    return identities
+
+
+def cert_has_required_hosts(cert_path, hosts):
+    if not Path(cert_path).exists():
+        return False
+    result = subprocess.run([
+        "openssl", "x509",
+        "-in", str(cert_path),
+        "-noout",
+        "-subject",
+        "-ext", "subjectAltName",
+    ], capture_output=True, text=True)
+    if result.returncode:
+        return False
+    identities = cert_identity_set_from_text(result.stdout)
+    for host in hosts:
+        kind = cert_host_kind(host)
+        wanted = (kind, host if kind == "IP" else host.lower())
+        if wanted not in identities:
+            return False
+    return True
 
 
 def ensure_base_certs():
@@ -2600,7 +3150,8 @@ def ensure_base_certs():
     server_csr = CERT_DIR / "taklite-server.csr"
     server_crt = CERT_DIR / "taklite-server.crt"
     server_ext = CERT_DIR / "taklite-server.ext"
-    server_name = SERVER_HOST or PUBLIC_HOST or "127.0.0.1"
+    server_hosts = tls_server_hosts()
+    server_name = server_hosts[0]
 
     CERT_DIR.mkdir(parents=True, exist_ok=True)
     if not ca_cert.exists() or not ca_key.exists():
@@ -2615,7 +3166,17 @@ def ensure_base_certs():
         ca_key.chmod(0o600)
         ca_cert.chmod(0o644)
 
-    if not HTTPS_CERT.exists() or not HTTPS_KEY.exists():
+    cert_needs_refresh = (
+        not HTTPS_CERT.exists()
+        or not HTTPS_KEY.exists()
+        or not cert_has_required_hosts(HTTPS_CERT, server_hosts)
+    )
+
+    if cert_needs_refresh:
+        if HTTPS_CERT.exists():
+            HTTPS_CERT.replace(HTTPS_CERT.with_suffix(f"{HTTPS_CERT.suffix}.bak.{int(time.time())}"))
+        if HTTPS_KEY.exists():
+            HTTPS_KEY.replace(HTTPS_KEY.with_suffix(f"{HTTPS_KEY.suffix}.bak.{int(time.time())}"))
         run_openssl(["genrsa", "-out", str(HTTPS_KEY), "3072"])
         run_openssl([
             "req", "-new",
@@ -2629,7 +3190,7 @@ def ensure_base_certs():
                 "basicConstraints=CA:FALSE",
                 "keyUsage = digitalSignature, keyEncipherment",
                 "extendedKeyUsage = serverAuth",
-                f"subjectAltName = {subject_alt_name_for_host(server_name)},DNS:taklite.local",
+                f"subjectAltName = {subject_alt_name_for_hosts(server_hosts)}",
                 "",
             ]),
             encoding="utf-8",
@@ -2659,15 +3220,47 @@ def ensure_truststore_file():
     tmp_truststore = CERT_DIR / ".taklite-truststore.p12.tmp"
     if not ca_cert.exists():
         raise RuntimeError("TAKlite CA is missing; rerun the installer or restore taklite-ca.crt")
-    run_openssl([
-        "pkcs12", "-export",
-        "-nokeys",
-        "-in", str(ca_cert),
-        "-out", str(tmp_truststore),
-        "-name", "taklite-ca",
-        *P12_CERT_COMPAT_ARGS,
-        "-passout", f"pass:{CERT_PASSWORD}",
-    ])
+    keytool = shutil.which("keytool")
+    if keytool:
+        if tmp_truststore.exists():
+            tmp_truststore.unlink()
+        result = subprocess.run([
+            keytool,
+            "-importcert",
+            "-noprompt",
+            "-storetype", "PKCS12",
+            "-alias", "taklite-ca",
+            "-file", str(ca_cert),
+            "-keystore", str(tmp_truststore),
+            "-storepass", CERT_PASSWORD,
+        ], capture_output=True, text=True)
+        if result.returncode:
+            raise RuntimeError((result.stderr or result.stdout or "keytool failed").strip())
+        tmp_truststore.replace(truststore)
+        truststore.chmod(0o644)
+        return truststore
+    try:
+        run_openssl([
+            "pkcs12", "-export",
+            "-nokeys",
+            "-in", str(ca_cert),
+            "-out", str(tmp_truststore),
+            "-name", "taklite-ca",
+            "-caname", "taklite-ca",
+            "-jdktrust", "anyExtendedKeyUsage",
+            *P12_CERT_COMPAT_ARGS,
+            "-passout", f"pass:{CERT_PASSWORD}",
+        ])
+    except RuntimeError:
+        run_openssl([
+            "pkcs12", "-export",
+            "-nokeys",
+            "-in", str(ca_cert),
+            "-out", str(tmp_truststore),
+            "-name", "taklite-ca",
+            *P12_CERT_COMPAT_ARGS,
+            "-passout", f"pass:{CERT_PASSWORD}",
+        ])
     tmp_truststore.replace(truststore)
     truststore.chmod(0o644)
     return truststore
@@ -2713,12 +3306,12 @@ def build_manifest(uid, display_name, truststore_name, client_cert_name):
     <Parameter name="uid" value="{html.escape(uid)}"/>
     <Parameter name="name" value="{html.escape(display_name)}"/>
     <Parameter name="onReceiveImport" value="true"/>
-    <Parameter name="onReceiveDelete" value="true"/>
+    <Parameter name="onReceiveDelete" value="false"/>
   </Configuration>
   <Contents>
-    <Content ignore="false" zipEntry="certs/server.pref"/>
     <Content ignore="false" zipEntry="certs/{html.escape(truststore_name)}"/>
     <Content ignore="false" zipEntry="certs/{html.escape(client_cert_name)}"/>
+    <Content ignore="false" zipEntry="certs/server.pref"/>
     <Content ignore="false" zipEntry="certs/taklite-plugin.json"/>
   </Contents>
 </MissionPackageManifest>
@@ -2755,8 +3348,8 @@ def build_plugin_config(name, plugin_token=""):
 
 
 def build_portal_user_plugin_config(user):
-    profile_name = user["profile_name"] or user["username"]
-    return build_plugin_config(profile_name, user["plugin_api_token"] or "")
+    profile_name = row_get(user, "profile_name", "") or row_get(user, "username", "")
+    return build_plugin_config(profile_name, row_get(user, "plugin_api_token", "") or "")
 
 
 def create_cert_profile(name, description="", plugin_token=""):
@@ -2811,10 +3404,10 @@ def create_cert_profile(name, description="", plugin_token=""):
     server_pref = build_server_pref(connect_string, truststore.name, client_p12.name, display_name)
     with zipfile.ZipFile(dp_zip, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("MANIFEST/manifest.xml", manifest)
-        zf.writestr("certs/server.pref", server_pref)
-        zf.writestr("certs/taklite-plugin.json", build_plugin_config(name, plugin_token))
         zf.write(truststore, f"certs/{truststore.name}")
         zf.write(client_p12, f"certs/{client_p12.name}")
+        zf.writestr("certs/server.pref", server_pref)
+        zf.writestr("certs/taklite-plugin.json", build_plugin_config(name, plugin_token))
     dp_zip.chmod(0o644)
 
     with db_connect() as conn:
@@ -3140,6 +3733,9 @@ class CotHandler(BaseRequestHandler):
                 match = EVENT_RE.search(candidate)
                 event = match.group(0) if match else candidate
                 self.events_in += 1
+                if is_pli_event(event) and not user_pli_enabled(self.user_id):
+                    print(f"CoT drop {self.remote} reason=pli_paused")
+                    continue
                 save_event(event, self.remote, self.user_id)
                 RELAY.broadcast(self, event)
 
@@ -4183,6 +4779,10 @@ class HttpHandler(BaseHTTPRequestHandler):
         if path == "/connect":
             self.send_text(CONNECT_HTML, content_type="text/html; charset=utf-8")
             return
+        if path == "/connect/enroll":
+            code = qs.get("code", [""])[0]
+            self.send_text(enrollment_connect_html(absolute_base_url(self), code), content_type="text/html; charset=utf-8")
+            return
         public_match = re.match(r"^/connect/([A-Za-z0-9_-]+)\.dp\.zip$", path)
         if public_match:
             row = find_cert_profile_by_token(public_match.group(1))
@@ -4440,6 +5040,34 @@ class HttpHandler(BaseHTTPRequestHandler):
                 return
             self.send_json(plugin_context_for_user(user))
             return
+        if path == "/api/plugin/admin/snapshot":
+            user = self.require_plugin_user()
+            if not user:
+                return
+            try:
+                self.send_json(plugin_admin_snapshot(user))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.FORBIDDEN)
+            return
+        if path == "/api/field-enrollments":
+            if not self.require_auth():
+                return
+            self.send_json({"items": list_field_enrollments(absolute_base_url(self))})
+            return
+        if path == "/api/field-enrollments/qr":
+            if not self.require_auth():
+                return
+            enrollment = find_field_enrollment(int(qs.get("id", ["0"])[0] or "0"))
+            if not enrollment:
+                self.send_json({"error": "field enrollment pass not found"}, HTTPStatus.NOT_FOUND)
+                return
+            info = enrollment_row(enrollment, absolute_base_url(self))
+            result = subprocess.run(["qrencode", "-t", "SVG", "-o", "-", info["join_url"]], capture_output=True)
+            if result.returncode:
+                self.send_json({"error": (result.stderr or b"qrencode failed").decode("utf-8", "replace")}, HTTPStatus.BAD_REQUEST)
+                return
+            self.send_bytes(result.stdout, content_type="image/svg+xml")
+            return
         if path == "/api/plugin/audience":
             user = self.require_plugin_user()
             if not user:
@@ -4463,6 +5091,15 @@ class HttpHandler(BaseHTTPRequestHandler):
                 details={"allowed": result["allowed_count"], "blocked": result["blocked_count"], "audience": result["audience"]},
             )
             self.send_json(result)
+            return
+        if path == "/api/plugin/datapackages/history":
+            user = self.require_plugin_user()
+            if not user:
+                return
+            try:
+                self.send_json(plugin_datapackage_history(user["id"], qs.get("limit", ["25"])[0]))
+            except Exception as exc:
+                self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
             return
         if path == "/api/datapackages":
             if not self.require_auth():
@@ -4703,6 +5340,63 @@ class HttpHandler(BaseHTTPRequestHandler):
                 if result is not None:
                     self.send_json(result, HTTPStatus.OK if result.get("ok") else HTTPStatus.BAD_REQUEST)
                 return
+            if path == "/api/plugin/field-enrollments/create":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                result = plugin_create_field_enrollment(user, self.read_json(), absolute_base_url(self))
+                self.send_json(result)
+                return
+            if path == "/api/plugin/field-enroll":
+                payload = self.read_json()
+                result = redeem_field_enrollment(
+                    payload.get("code", payload.get("token", "")),
+                    self.client_address[0],
+                    payload.get("device_id", payload.get("device_mac", self.headers.get("X-Axon-Device-Mac", ""))),
+                    payload.get("display_name", payload.get("callsign", "")),
+                    absolute_base_url(self),
+                )
+                self.send_json(result)
+                return
+            if path == "/api/plugin/privacy/pli":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                payload = self.read_json()
+                try:
+                    self.send_json(set_user_pli_enabled(user, payload.get("user_id", user["id"]), validate_bool(payload.get("enabled", True))))
+                except Exception as exc:
+                    self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/plugin/policy/test":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                payload = self.read_json()
+                try:
+                    self.send_json(plugin_policy_test(user, payload.get("source_user_id", user["id"]), payload.get("target_user_id", 0)))
+                except Exception as exc:
+                    self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/plugin/admin/revoke-user":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                try:
+                    self.send_json(plugin_revoke_user(user, self.read_json().get("user_id", 0)))
+                except Exception as exc:
+                    self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+            if path == "/api/plugin/admin/reissue-user":
+                user = self.require_plugin_user()
+                if not user:
+                    return
+                try:
+                    self.send_json(plugin_reissue_user(user, self.read_json().get("user_id", 0)))
+                except Exception as exc:
+                    self.send_json({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                return
+                return
             if path in ("/Marti/sync/missionupload", "/sync/missionupload"):
                 upload_datapackage_from_request(self, qs, response_url="metadata")
                 return
@@ -4786,6 +5480,28 @@ class HttpHandler(BaseHTTPRequestHandler):
                     payload.get("group_ids", []),
                     payload.get("access_level"),
                 ))
+                return
+            if path == "/api/field-enrollments/create":
+                if not self.require_auth():
+                    return
+                payload = self.read_json()
+                self.send_json(create_field_enrollment(
+                    payload.get("name", ""),
+                    payload.get("username_prefix", ""),
+                    payload.get("description", ""),
+                    payload.get("expires_in_hours", 24),
+                    payload.get("max_uses", 1),
+                    payload.get("role_id"),
+                    payload.get("group_ids", []),
+                    payload.get("access_level"),
+                    absolute_base_url(self),
+                ))
+                return
+            if path == "/api/field-enrollments/revoke":
+                if not self.require_auth():
+                    return
+                payload = self.read_json()
+                self.send_json(revoke_field_enrollment(int(payload.get("id", 0))))
                 return
             if path == "/api/access-roles/create":
                 if not self.require_auth():
@@ -5014,6 +5730,47 @@ async function logout(){try{await api('/api/logout',{method:'POST',body:'{}'})}c
 init();
 setInterval(load,15000);
 </script></body></html>"""
+
+
+def enrollment_connect_html(base_url, code):
+    base = (base_url or "").strip().rstrip("/")
+    code = (code or "").strip()
+    join_url = f"{base}/connect/enroll?code={quote(code)}" if base and code else ""
+    axon_url = f"axon://field-enroll?server={quote(base)}&code={quote(code)}" if base and code else ""
+    safe_base = html.escape(base)
+    safe_code = html.escape(code)
+    safe_join_url = html.escape(join_url)
+    safe_axon_url = html.escape(axon_url)
+    qr_markup = ""
+    if join_url:
+        result = subprocess.run(["qrencode", "-t", "SVG", "-o", "-", join_url], capture_output=True)
+        if result.returncode == 0:
+            qr_markup = result.stdout.decode("utf-8", "replace")
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Axon Field Enrollment</title>
+<style>
+body{{margin:0;font-family:system-ui,-apple-system,Segoe UI,sans-serif;background:#09100d;color:#e5ece6}}
+header{{background:#0d1712;border-bottom:1px solid rgba(190,214,197,.14);padding:18px 22px}}h1{{font-size:20px;margin:0}}
+.wrap{{max-width:620px;margin:0 auto;padding:26px 18px}}.panel{{background:#111d17;border:1px solid rgba(190,214,197,.14);border-radius:12px;padding:18px}}
+p{{color:#92a197;line-height:1.45}}label{{display:block;margin-top:16px;color:#92a197;font-size:12px;font-weight:800;text-transform:uppercase}}
+code{{display:block;margin-top:6px;padding:12px;border:1px solid rgba(190,214,197,.14);border-radius:10px;background:#09100d;color:#e5ece6;word-break:break-all}}
+.qr{{display:flex;justify-content:center;margin:18px 0;padding:14px;background:#f8fbf8;border-radius:14px}}.qr svg{{width:min(72vw,320px);height:auto;display:block}}
+a.button{{display:block;margin:18px 0 6px;padding:14px 16px;border-radius:10px;background:#4fb477;color:#07100b;text-decoration:none;text-align:center;font-weight:900}}
+</style>
+</head>
+<body><header><h1>Axon Field Enrollment</h1></header><main class="wrap"><section class="panel">
+{f'<div class="qr">{qr_markup}</div>' if qr_markup else ''}
+<p>Tap <strong>Open in Axon</strong> on the new device to redeem this pass. If the button is unavailable, open Axon inside ATAK, then go to <strong>Settings -> Profile -> Field Enrollment</strong> and enter the server URL and Join Code below.</p>
+{f'<a class="button" href="{safe_axon_url}">Open in Axon</a>' if axon_url else ''}
+<label>Server URL</label><code>{safe_base}</code>
+<label>Join Code</label><code>{safe_code}</code>
+<label>Enrollment URL</label><code>{safe_join_url}</code>
+<label>Axon Link</label><code>{safe_axon_url}</code>
+<p>This pass may expire or run out of uses. If it fails, ask an admin to create a new Field Enrollment pass.</p>
+</section></main></body></html>"""
 
 
 CONNECT_HTML = """<!doctype html>

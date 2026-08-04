@@ -227,6 +227,58 @@ class MartiCompatibilityTests(unittest.TestCase):
         self.assertEqual(row["Visibility"], "public")
         self.assertTrue(self.service.package_visible_to_user(self.service.row_to_package(row), None, enforce=True))
 
+    def test_user_created_public_tool_package_is_filtered_by_marti_endpoints(self):
+        self.service.ACCESS_CONTROL_ENFORCE = True
+        participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+        bravo = self.service.create_access_group("Bravo")
+        alpha_one = self.service.create_policy_subject("alpha-one", role_id=participant["id"], group_ids=[alpha["id"]])
+        alpha_two = self.service.create_policy_subject("alpha-two", role_id=participant["id"], group_ids=[alpha["id"]])
+        bravo_one = self.service.create_policy_subject("bravo-one", role_id=participant["id"], group_ids=[bravo["id"]])
+        payload = datapackage_bytes("server-enforced-policy")
+        self.service.upsert_package(
+            "serverpolicyhash",
+            "server-policy.dp.zip",
+            "ANDROID-1",
+            payload,
+            "http://127.0.0.1",
+            visibility="public",
+            creator_user_id=alpha_one["id"],
+            policy={"mode": "sender", "allowed_levels": []},
+        )
+        with self.service.db_connect() as conn:
+            conn.execute("update datapackages set Tool = ? where Hash = ?", ("public", "serverpolicyhash"))
+            conn.commit()
+
+        original = self.service.HttpHandler.authenticated_user_id
+        try:
+            self.service.HttpHandler.authenticated_user_id = lambda handler: bravo_one["id"]
+            status, _, response = self.request("GET", "/Marti/sync/search?keywords=missionpackage")
+            self.assertEqual(status, 200, response.decode("utf-8", "replace"))
+            result = json.loads(response.decode("utf-8"))
+            self.assertEqual(result["resultCount"], 0)
+
+            status, _, response = self.request("GET", "/Marti/sync/missionquery?hash=serverpolicyhash")
+            self.assertEqual(status, 403, response.decode("utf-8", "replace"))
+
+            status, _, response = self.request("GET", "/Marti/sync/content?hash=serverpolicyhash")
+            self.assertEqual(status, 403, response.decode("utf-8", "replace"))
+
+            self.service.HttpHandler.authenticated_user_id = lambda handler: alpha_two["id"]
+            status, _, response = self.request("GET", "/Marti/sync/search?keywords=missionpackage")
+            self.assertEqual(status, 200, response.decode("utf-8", "replace"))
+            result = json.loads(response.decode("utf-8"))
+            self.assertEqual(result["resultCount"], 1)
+
+            status, _, response = self.request("GET", "/Marti/sync/missionquery?hash=serverpolicyhash")
+            self.assertEqual(status, 200, response.decode("utf-8", "replace"))
+
+            status, _, response = self.request("GET", "/Marti/sync/content?hash=serverpolicyhash")
+            self.assertEqual(status, 200, response.decode("utf-8", "replace"))
+            self.assertEqual(response, payload)
+        finally:
+            self.service.HttpHandler.authenticated_user_id = original
+
     def test_sync_metadata_tool_get_downloads_datapackage(self):
         payload = datapackage_bytes("metadata-download")
         self.service.upsert_package("downloadhash", "download-map.zip", "ANDROID-1", payload, "http://127.0.0.1")
@@ -303,11 +355,12 @@ class MartiCompatibilityTests(unittest.TestCase):
         self.assertEqual(status, 200)
         result = json.loads(body.decode("utf-8"))
         self.assertEqual(result["version"], 3)
-        self.assertEqual(result["type"], "ClientEndpointList")
+        self.assertEqual(result["type"], "com.bbn.marti.remote.ClientEndpoint")
         self.assertEqual(result["data"][0]["uid"], "ANDROID-1")
         self.assertEqual(result["data"][0]["callsign"], "Alpha One")
-        self.assertEqual(result["data"][0]["address"], "10.66.66.3")
-        self.assertEqual(result["data"][0]["lastEventTime"], "2026-06-25T15:00:12Z")
+        self.assertEqual(result["data"][0]["lastStatus"], "Connected")
+        self.assertEqual(result["data"][0]["lastEventTime"], "2026-06-25T15:00:12.000Z")
+        self.assertNotIn("address", result["data"][0])
 
     def test_mission_compatibility_routes_return_empty_lists(self):
         for path in (

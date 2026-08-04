@@ -334,7 +334,7 @@ class AccessControlTests(unittest.TestCase):
         alpha = self.service.create_access_group("Alpha")
         sender = self.service.create_policy_subject("sender", role_id=role["id"], group_ids=[alpha["id"]])
         target = self.service.create_policy_subject("target", role_id=role["id"], group_ids=[alpha["id"]])
-        sender_row = self.service.portal_user_row(self.service.find_portal_user(sender["id"]))
+        sender_row = self.service.portal_user_row(self.service.find_portal_user(sender["id"]), include_plugin_token=True)
         token_row = self.service.find_portal_user_by_plugin_token(sender_row["plugin_api_token"])
         user = self.service.portal_user_row(token_row)
         context = self.service.plugin_context_for_user(user)
@@ -344,6 +344,7 @@ class AccessControlTests(unittest.TestCase):
         })
 
         self.assertEqual(context["user"]["username"], "sender")
+        self.assertNotIn("plugin_api_token", context["user"])
         self.assertFalse(context["capabilities"]["broad_access"])
         self.assertFalse(context["capabilities"]["can_see_all"])
         self.assertTrue(context["capabilities"]["can_send_own_groups"])
@@ -377,6 +378,62 @@ class AccessControlTests(unittest.TestCase):
             conn.execute("update portal_users set assigned_ip = ? where id = ?", ("10.66.66.24", first["id"]))
             conn.commit()
         self.assertIsNone(self.service.find_portal_user_by_device_binding("10.66.66.24"))
+
+    def test_field_enrollment_creates_bound_user_and_profile_once(self):
+        cert_dir = pathlib.Path(self.tmpdir.name) / "certs"
+        cert_dir.mkdir(exist_ok=True)
+        (cert_dir / "taklite-ca.crt").write_text("ca", encoding="utf-8")
+        (cert_dir / "taklite-ca.key").write_text("key", encoding="utf-8")
+        truststore = cert_dir / "taklite-truststore.p12"
+        truststore.write_bytes(b"truststore")
+
+        def fake_openssl(args):
+            if "-out" in args:
+                pathlib.Path(args[args.index("-out") + 1]).write_bytes(b"generated")
+
+        role = self.service.create_access_role("Field Lead", can_see_own_groups=True, can_send_own_groups=True)
+        group = self.service.create_access_group("Alpha")
+        enrollment = self.service.create_field_enrollment(
+            "Alpha Join",
+            "alpha",
+            "field add",
+            expires_in_hours=2,
+            max_uses=1,
+            role_id=role["id"],
+            group_ids=[group["id"]],
+            access_level=2,
+            base_url="http://10.66.66.1:8080",
+        )
+
+        self.assertTrue(enrollment["active"])
+        self.assertEqual(enrollment["remaining_uses"], 1)
+        self.assertIn("/connect/enroll?code=", enrollment["join_url"])
+
+        with mock.patch.object(self.service, "ensure_truststore_file", return_value=truststore), \
+             mock.patch.object(self.service, "run_openssl", side_effect=fake_openssl):
+            result = self.service.redeem_field_enrollment(
+                enrollment["join_code"],
+                source_ip="10.66.66.44",
+                device_id="AABBCCDDEEFF",
+                display_name="Alpha One",
+                base_url="http://10.66.66.1:8080",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["user"]["assigned_ip"], "10.66.66.44")
+        self.assertEqual(result["user"]["device_mac"], "aa:bb:cc:dd:ee:ff")
+        self.assertEqual(result["user"]["role_id"], role["id"])
+        self.assertEqual(result["user"]["group_ids"], [group["id"]])
+        self.assertEqual(result["user"]["access_level"], 2)
+        self.assertTrue(result["profile"]["plugin_token"].startswith("tlp_"))
+        self.assertIn("/connect/", result["connection_package_url"])
+
+        updated = self.service.list_field_enrollments("http://10.66.66.1:8080")[0]
+        self.assertEqual(updated["used_count"], 1)
+        self.assertEqual(updated["remaining_uses"], 0)
+        self.assertFalse(updated["active"])
+        with self.assertRaisesRegex(ValueError, "no remaining uses"):
+            self.service.redeem_field_enrollment(enrollment["join_code"], "10.66.66.45", "", "Alpha Two")
 
     def test_admin_datapackage_send_records_offline_pending_delivery(self):
         creator = self.service.create_policy_subject("creator")
@@ -452,6 +509,28 @@ class AccessControlTests(unittest.TestCase):
         package = {"CreatorUserId": None, "Visibility": "private", "Tool": "public"}
 
         self.assertTrue(self.service.package_visible_to_user(package, None, enforce=True))
+
+    def test_user_created_public_tool_datapackage_still_follows_access_policy(self):
+        participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
+        alpha = self.service.create_access_group("Alpha")
+        bravo = self.service.create_access_group("Bravo")
+        alpha_one = self.service.create_policy_subject("alpha-one", role_id=participant["id"], group_ids=[alpha["id"]])
+        alpha_two = self.service.create_policy_subject("alpha-two", role_id=participant["id"], group_ids=[alpha["id"]])
+        bravo_one = self.service.create_policy_subject("bravo-one", role_id=participant["id"], group_ids=[bravo["id"]])
+
+        package = {
+            "CreatorUserId": alpha_one["id"],
+            "Visibility": "public",
+            "Tool": "public",
+            "PolicyMode": "sender",
+            "AllowedLevels": [],
+        }
+
+        self.assertFalse(self.service.package_visible_to_user(package, None, enforce=True))
+        self.assertTrue(self.service.package_visible_to_user(package, alpha_two["id"], enforce=True))
+        blocked = self.service.package_access_for_user(package, bravo_one["id"], enforce=True)
+        self.assertFalse(blocked["allowed"])
+        self.assertEqual(blocked["reason_code"], "blocked_sender_policy")
 
     def test_access_preview_reports_visible_and_seen_by_users(self):
         admin = self.service.create_access_role("Admin", can_see_all=True, can_send_all=True)
@@ -543,6 +622,8 @@ class AccessControlTests(unittest.TestCase):
         self.assertNotIn("server.pref", names)
         self.assertNotIn("taklite-server.pref", names)
         self.assertEqual(len(names), len(set(names)))
+        self.assertLess(names.index("certs/10.66.66.1.p12"), names.index("certs/server.pref"))
+        self.assertLess(names.index("certs/alpha-phone.p12"), names.index("certs/server.pref"))
         with zipfile.ZipFile(package) as zf:
             server_pref = zf.read("certs/server.pref").decode("utf-8")
             manifest = zf.read("MANIFEST/manifest.xml").decode("utf-8")
@@ -558,6 +639,9 @@ class AccessControlTests(unittest.TestCase):
         self.assertIn('<entry key="apiSecureServerPort" class="class java.lang.String">8443</entry>', server_pref)
         self.assertIn('<entry key="apiUnsecureServerPort" class="class java.lang.String">8080</entry>', server_pref)
         self.assertIn('<Parameter name="onReceiveImport" value="true"/>', manifest)
+        self.assertIn('<Parameter name="onReceiveDelete" value="false"/>', manifest)
+        self.assertLess(manifest.index('zipEntry="certs/10.66.66.1.p12"'), manifest.index('zipEntry="certs/server.pref"'))
+        self.assertLess(manifest.index('zipEntry="certs/alpha-phone.p12"'), manifest.index('zipEntry="certs/server.pref"'))
         self.assertIn('<Content ignore="false" zipEntry="certs/server.pref"/>', manifest)
         self.assertIn('<Content ignore="false" zipEntry="certs/taklite-plugin.json"/>', manifest)
         self.assertIn('<Content ignore="false" zipEntry="certs/10.66.66.1.p12"/>', manifest)
@@ -597,7 +681,8 @@ class AccessControlTests(unittest.TestCase):
             out_path = pathlib.Path(args[args.index("-out") + 1])
             out_path.write_bytes(b"truststore")
 
-        with mock.patch.object(self.service, "run_openssl", side_effect=fake_openssl):
+        with mock.patch.object(self.service.shutil, "which", return_value=None), \
+             mock.patch.object(self.service, "run_openssl", side_effect=fake_openssl):
             truststore = self.service.ensure_truststore_file()
 
         self.assertEqual(truststore.name, "taklite-truststore.p12")
@@ -613,6 +698,38 @@ class AccessControlTests(unittest.TestCase):
         self.assertNotIn("-keypbe", pkcs12_calls[0])
         self.assertIn("-macalg", pkcs12_calls[0])
         self.assertIn("sha1", pkcs12_calls[0])
+
+    def test_server_cert_identity_parses_ip_dns_and_cn(self):
+        text = """
+subject=CN=10.0.2.2
+X509v3 Subject Alternative Name:
+    IP Address:10.0.2.2, IP Address:192.168.0.115, DNS:taklite.local, DNS:Example.local
+"""
+        identities = self.service.cert_identity_set_from_text(text)
+
+        self.assertIn(("IP", "10.0.2.2"), identities)
+        self.assertIn(("IP", "192.168.0.115"), identities)
+        self.assertIn(("DNS", "taklite.local"), identities)
+        self.assertIn(("DNS", "example.local"), identities)
+
+    def test_server_cert_sans_include_server_public_and_local_names(self):
+        original_server = self.service.SERVER_HOST
+        original_public = self.service.PUBLIC_HOST
+        try:
+            self.service.SERVER_HOST = "192.168.0.115"
+            self.service.PUBLIC_HOST = "axon.local"
+
+            hosts = self.service.tls_server_hosts()
+            sans = self.service.subject_alt_name_for_hosts(hosts)
+        finally:
+            self.service.SERVER_HOST = original_server
+            self.service.PUBLIC_HOST = original_public
+
+        self.assertIn("IP:192.168.0.115", sans)
+        self.assertIn("DNS:axon.local", sans)
+        self.assertIn("DNS:localhost", sans)
+        self.assertIn("IP:127.0.0.1", sans)
+        self.assertIn("DNS:taklite.local", sans)
 
 
 if __name__ == "__main__":
