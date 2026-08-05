@@ -1,6 +1,6 @@
 # TAKlite Access Control Guide
 
-Version: TAKlite v0.2.24
+Version: TAKlite v0.2.25
 
 ## Purpose
 
@@ -493,4 +493,3 @@ Before handing out connection packages:
 - Team links set only where needed
 - Access Preview checked for each team
 - Test two real TAK clients before scaling up
-

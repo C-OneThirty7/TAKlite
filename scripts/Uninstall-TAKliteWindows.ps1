@@ -26,6 +26,7 @@ try {
 } catch {}
 
 Remove-TAKliteFirewallRules
+Remove-TAKliteGuiUpdateRunner
 
 $deleteData = Confirm-TAKliteAction `
     -Title "Delete TAKlite Data?" `

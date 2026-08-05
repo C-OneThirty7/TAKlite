@@ -41,6 +41,7 @@ function Load-TAKliteImage {
     }
 }
 
+$loadedOfflineImage = $false
 $updateDir = Join-Path $script:BundleRoot "update"
 New-Item -ItemType Directory -Path $updateDir -Force | Out-Null
 $updateZip = Get-ChildItem -LiteralPath $updateDir -Filter "*.zip" -File -ErrorAction SilentlyContinue |
@@ -58,8 +59,9 @@ if ($updateZip) {
         $sourceImage = Join-Path $sourceRoot "images\taklite-offline.tar"
         if (Test-Path -LiteralPath $sourceImage -PathType Leaf) {
             Load-TAKliteImage -ImagePath $sourceImage
+            $loadedOfflineImage = $true
         } else {
-            Write-Host "No offline image was found inside the update zip. Existing/local image will be used."
+            Write-Host "No offline image was found inside the update zip. Docker will rebuild TAKlite from the release source."
         }
         Write-Host "Copying updated TAKlite files while preserving local data..."
         Copy-TAKliteBundleFiles -SourceRoot $sourceRoot
@@ -68,12 +70,17 @@ if ($updateZip) {
     }
 } elseif (Test-Path -LiteralPath $script:OfflineImagePath -PathType Leaf) {
     Load-TAKliteImage -ImagePath $script:OfflineImagePath
+    $loadedOfflineImage = $true
 } else {
     Write-Host "No update zip or bundled offline image found. Docker will use the currently available TAKlite image."
 }
 
 Write-Host "Applying TAKlite update while preserving .env, users, certs, packages, and database..."
-Invoke-TAKliteCompose @("up", "--detach", "--no-build")
+if ($loadedOfflineImage) {
+    Invoke-TAKliteCompose @("up", "--detach", "--no-build")
+} else {
+    Invoke-TAKliteCompose @("up", "--detach", "--build")
+}
 
 Show-TAKliteSummary
 Write-Host "TAKlite update completed."

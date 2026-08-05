@@ -130,6 +130,8 @@ Use `update.sh`. It preserves:
 
 Updates do not overwrite the existing `TAKLITE_CERT_PASSWORD` in `.env`. If an older server used a long certificate password and you want to switch to `atakatak`, edit `/root/taklite/.env`, restart TAKlite, then reissue affected connection users or create new connection packages. Existing already-downloaded `.dp.zip` files keep the password they were created with.
 
+If the server has internet, the TAKlite Admin `Settings` page can run the same update path through the GUI update button. The GUI updater downloads the standard `TAKlite-vX.Y.Z.zip`, verifies the release SHA-256 digest, and then calls the host updater.
+
 From your admin computer:
 
 ```bash

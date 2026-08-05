@@ -161,15 +161,40 @@ scp root@YOUR_VPS_PUBLIC_IP:/root/taklite-admin/admin-wg0.conf .
 rsync -av root@YOUR_VPS_PUBLIC_IP:/root/taklite-admin/admin-wg0.conf .
 ```
 
-## Update Existing Server
+## Release Assets And Updates
+
+TAKlite releases use one version number across all install modes. Different files are platform packaging, not different TAKlite behavior.
+
+| Asset | Use This For | Internet Needed During Update |
+| --- | --- | --- |
+| `TAKlite-vX.Y.Z.zip` | Linux/VPS installs, Linux GUI update button, online Docker updates, and source-based updates | Yes |
+| `TAKlite-vX.Y.Z.zip.sha256` | Manual hash verification for the source/update zip | No |
+| `TAKlite-windows-docker-offline-vX.Y.Z.zip` | Windows Docker Desktop installs or updates when the machine may not have internet | No |
+| `TAKlite-windows-docker-offline-vX.Y.Z.zip.sha256` | Manual hash verification for the Windows offline bundle | No |
+
+Same version means same TAKlite backend, API, admin UI, and access-control behavior. The Windows offline bundle adds Windows launchers and a prebuilt Docker image so Docker Desktop does not have to pull or build from the internet.
+
+## Update Existing Linux/VPS Server
 
 Do not rerun `install.sh` for normal updates. Use one of the two workflows below so TAKlite keeps existing WireGuard peers, TAKlite users, certs, datapackages, generated packages, database state, and `.env` settings.
 
 Updates preserve custom network settings and ports, including changed TAKlite HTTP/HTTPS/CoT ports, WireGuard bind IP, and WGDashboard URL.
 
-The Settings page also includes a GUI update button. GUI updates only run when the GitHub release exposes a TAKlite release zip with a SHA-256 digest, then the host runner checks that hash before applying the update.
+The Settings page includes an update button. Online GUI updates use the standard `TAKlite-vX.Y.Z.zip` release asset, require internet access from the server, verify the GitHub release SHA-256 digest, then apply the update through the host runner.
 
-### Option 1: Update From GitHub
+### Option 1: GUI Update Button
+
+Use this when the server has internet:
+
+1. Open TAKlite Admin.
+2. Go to `Settings`.
+3. Click `Check for Update` or `Update TAKlite`.
+4. Confirm the update.
+5. Wait for TAKlite to restart, then refresh the browser.
+
+If the GUI says the update runner is not enabled, use Option 2 once. The update installs the runner for future GUI updates.
+
+### Option 2: Update From GitHub Clone
 
 Run this on the VPS:
 
@@ -199,7 +224,7 @@ git clone --depth 1 https://github.com/C-OneThirty7/TAKlite.git "$STAGE"
 bash "$STAGE/update.sh" --from-dir "$STAGE" --app-dir "$APP_DIR"
 ```
 
-### Option 2: Update From Release Zip
+### Option 3: Update From Release Zip
 
 From your admin computer, upload the release zip:
 
@@ -227,6 +252,28 @@ bash "$APP_DIR/update.sh" /root/TAKlite-vX.Y.Z.zip
 ```
 
 Never clone or unzip directly over the live TAKlite app directory. Stage the new release first, then let `update.sh` preserve the live server state.
+
+## Update Windows Docker Desktop
+
+Windows Docker Desktop has two update paths.
+
+Online update:
+
+1. Make sure Docker Desktop is running.
+2. Open TAKlite Admin.
+3. Go to `Settings`.
+4. Click `Check for Update` or `Update TAKlite`.
+
+The Windows GUI update runner downloads the standard `TAKlite-vX.Y.Z.zip`, verifies its SHA-256 digest, applies the update, and rebuilds the TAKlite Docker image locally. This requires internet access.
+
+Offline update:
+
+1. On any computer with internet, download `TAKlite-windows-docker-offline-vX.Y.Z.zip` from the GitHub release.
+2. Move that zip to the existing Windows TAKlite folder.
+3. Put it inside the folder named `update`.
+4. Double-click `Update TAKlite.cmd`.
+
+The offline updater loads the bundled Docker image and preserves `.env`, users, admin account, certs, datapackages, generated connection packages, and the local database.
 
 ## Uninstall Or Reinstall
 
@@ -281,6 +328,7 @@ Optional admin 2FA can be enabled from Settings after the first admin account is
 - [Windows Docker Desktop Guide PDF](docs/TAKlite-Windows-Docker-Desktop-Guide.pdf)
 - [Access Control Guide](docs/access-control-guide.md)
 - [Access Control Guide PDF](docs/TAKlite-Access-Control-Guide.pdf)
+- [Release Assets And Updates](docs/release-assets-and-updates.md)
 - [Deployment And Update Lifecycle](docs/deployment-lifecycle.md)
 - [Backup And Restore](docs/backup-restore.md)
 - [Dependency Update Checklist](docs/dependency-update-checklist.md)

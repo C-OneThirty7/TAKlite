@@ -227,13 +227,30 @@ taklite\certs
 
 ## Update
 
-For offline Windows updates:
+Windows Docker Desktop supports online and offline updates.
+
+### Online GUI Update
+
+Use this when the Windows host has internet:
+
+1. Make sure Docker Desktop is running.
+2. Open TAKlite Admin.
+3. Go to `Settings`.
+4. Click `Check for Update` or `Update TAKlite`.
+
+The GUI update runner downloads the standard `TAKlite-vX.Y.Z.zip`, verifies the GitHub release SHA-256 digest, applies the update, and rebuilds the TAKlite Docker image locally.
+
+If the Settings page says the GUI update runner is not enabled, rerun `Install TAKlite.cmd` from the current folder. It preserves the existing `.env` and runtime data while installing the runner.
+
+### Offline Update
+
+Use this when the Windows host has no internet or should not build from the internet:
 
 1. Keep the current TAKlite folder in place.
 2. Copy the newer `TAKlite-windows-docker-offline-vX.Y.Z.zip` into the current folder's `update` directory.
 3. Double-click `Update TAKlite.cmd`.
 
-The updater extracts the newest zip in `update`, loads the bundled Docker image, copies updated application files, and preserves:
+The offline updater extracts the newest zip in `update`, loads the bundled Docker image, copies updated application files, and preserves:
 
 - `.env`
 - users
@@ -243,4 +260,6 @@ The updater extracts the newest zip in `update`, loads the bundled Docker image,
 - generated connection packages
 - local database
 
-If the current bundle is old enough that it does not have `Update TAKlite.cmd`, extract the newer bundle beside it and run the newer installer with the same bind IP, or copy the newer files over the old folder while preserving `.env` and the `taklite` runtime folder.
+Use the Windows offline asset for offline Windows updates. The normal `TAKlite-vX.Y.Z.zip` source bundle is correct for online updates, but it may require Docker to rebuild the TAKlite image.
+
+If the current bundle is old enough that it does not have `Update TAKlite.cmd`, extract the newer Windows offline bundle beside it and run the newer installer with the same bind IP, or copy the newer files over the old folder while preserving `.env` and the `taklite` runtime folder.

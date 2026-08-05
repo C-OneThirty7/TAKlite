@@ -176,6 +176,20 @@ function Write-TAKliteEnvironment {
             Add-Content -LiteralPath $EnvironmentPath -Value "TAKLITE_IMAGE=$OfflineImageName"
             Write-Host "Added offline image setting to existing .env."
         }
+        $addedRunnerSettings = $false
+        foreach ($line in @(
+            "TAKLITE_GUI_UPDATE_ENABLED=true",
+            "TAKLITE_GUI_UPDATE_REQUEST_DIR=/data/gui-update"
+        )) {
+            $key = ($line -split "=", 2)[0]
+            if (-not $envValues.ContainsKey($key)) {
+                Add-Content -LiteralPath $EnvironmentPath -Value $line
+                $addedRunnerSettings = $true
+            }
+        }
+        if ($addedRunnerSettings) {
+            Write-Host "Added GUI update runner settings to existing .env."
+        }
         Write-Host "Using existing .env for $envBindIp. Use -EnvMode Recreate to regenerate Windows Docker settings."
         return
     }
@@ -206,11 +220,11 @@ function Write-TAKliteEnvironment {
         "TAKLITE_ACCESS_CONTROL_ENFORCE=true",
         "TAKLITE_LEGACY_CERT_DOWNLOADS=false",
         "TAKLITE_SOCKET_SEND_TIMEOUT_SECONDS=2.5",
-        "TAKLITE_GUI_UPDATE_ENABLED=false",
+        "TAKLITE_GUI_UPDATE_ENABLED=true",
         "TAKLITE_GUI_UPDATE_COMMAND=",
         "TAKLITE_GUI_UPDATE_WORKDIR=",
         "TAKLITE_GUI_UPDATE_TIMEOUT_SECONDS=900",
-        "TAKLITE_GUI_UPDATE_REQUEST_DIR=",
+        "TAKLITE_GUI_UPDATE_REQUEST_DIR=/data/gui-update",
         "TAKLITE_SETTINGS_REQUEST_DIR=",
         "TAKLITE_FIREWALL_REQUEST_DIR=",
         "TAKLITE_WG_INTERFACE=",
@@ -258,6 +272,30 @@ function Configure-TAKliteFirewall {
     Write-Host "Created Windows Firewall rule group 'TAKlite' for TCP ports $($tcpPorts -join ', ') on $BindIp."
 }
 
+function Install-TAKliteGuiUpdateRunner {
+    $runner = Join-Path $BundleRoot "scripts\GuiUpdateRunner-TAKliteWindows.ps1"
+    if (-not (Test-Path -LiteralPath $runner -PathType Leaf)) {
+        Write-Host "GUI update runner script not found; GUI update button will report runner unavailable."
+        return
+    }
+    New-Item -ItemType Directory -Force -Path `
+        (Join-Path $RuntimeRoot "data\gui-update"), `
+        (Join-Path $BundleRoot "taklite-admin") | Out-Null
+
+    $taskName = "TAKlite GUI Update Runner"
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$runner`""
+    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    $principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Highest
+    try {
+        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Force | Out-Null
+        Start-ScheduledTask -TaskName $taskName
+        Write-Host "Installed and started Windows GUI update runner."
+    } catch {
+        Write-Host "GUI update runner warning: $($_.Exception.Message)"
+        Write-Host "Online GUI updates may be unavailable. Manual offline/online updates still work through Update TAKlite.cmd."
+    }
+}
+
 function Invoke-TAKliteCompose {
     & docker compose --project-name $ProjectName --env-file $EnvironmentPath --file $ComposeFile config --quiet
     if ($LASTEXITCODE -ne 0) {
@@ -296,6 +334,7 @@ if ((Test-Path -LiteralPath $EnvironmentPath -PathType Leaf) -and $EnvMode -eq "
 $selectedAdapter = Select-TAKliteNetwork
 Write-TAKliteEnvironment
 Configure-TAKliteFirewall
+Install-TAKliteGuiUpdateRunner
 Invoke-TAKliteCompose
 
 $envValues = Read-TAKliteEnvironment

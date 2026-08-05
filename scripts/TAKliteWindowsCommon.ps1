@@ -121,6 +121,15 @@ function Remove-TAKliteFirewallRules {
     }
 }
 
+function Remove-TAKliteGuiUpdateRunner {
+    try {
+        Unregister-ScheduledTask -TaskName "TAKlite GUI Update Runner" -Confirm:$false -ErrorAction SilentlyContinue
+        Write-Host "Removed Windows GUI update runner scheduled task if it existed."
+    } catch {
+        Write-Host "GUI update runner cleanup warning: $($_.Exception.Message)"
+    }
+}
+
 function Show-TAKliteSummary {
     $envValues = Read-TAKliteEnvironment
     $hostValue = Get-TAKliteEnvValue $envValues "TAKLITE_PUBLIC_HOST" "127.0.0.1"

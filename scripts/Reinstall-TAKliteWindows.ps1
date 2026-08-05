@@ -26,6 +26,7 @@ try {
 } catch {}
 
 Remove-TAKliteFirewallRules
+Remove-TAKliteGuiUpdateRunner
 Remove-Item -LiteralPath $script:EnvironmentPath -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $script:RuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
 
