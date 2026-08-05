@@ -52,7 +52,7 @@ DB_PATH = Path(os.environ.get("TAKLITE_DB", "/data/taklite.sqlite3"))
 PACKAGE_DIR = Path(os.environ.get("TAKLITE_PACKAGE_DIR", "/packages"))
 STATIC_DIR = Path(os.environ.get("TAKLITE_STATIC_DIR", "/app/static"))
 WG_DASHBOARD_URL = os.environ.get("TAKLITE_WGDASHBOARD_URL", "")
-VERSION = "TAKlite 0.2.23"
+VERSION = "TAKlite 0.2.24"
 STARTED_AT = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 PORTAL_SESSION_HOURS = 2
 MAX_UPLOAD_BYTES = int(os.environ.get("TAKLITE_MAX_UPLOAD_BYTES", str(256 * 1024 * 1024)))
@@ -1242,7 +1242,7 @@ def set_user_access(user_id, role_id=None, group_ids=None, access_level=ACCESS_L
     return attach_access_to_users([portal_user_row(find_portal_user(user_id))])[0]
 
 
-def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="replace", access_level=None, level_mode="unchanged"):
+def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="replace", access_level=None, level_mode="unchanged", role_mode="unchanged"):
     user_ids = sorted({int(value) for value in (user_ids or []) if str(value).strip()})
     if not user_ids:
         raise ValueError("select at least one user")
@@ -1251,6 +1251,13 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
     if group_mode not in ("replace", "add", "remove"):
         raise ValueError("group mode must be replace, add, or remove")
     role_id = int(role_id or 0) or None
+    role_mode = (role_mode or "unchanged").strip().lower()
+    if role_mode not in ("unchanged", "set", "clear"):
+        raise ValueError("access override action must be unchanged, set, or clear")
+    if role_mode == "unchanged" and role_id is not None:
+        role_mode = "set"
+    if role_mode == "set" and role_id is None:
+        raise ValueError("choose an access override")
     level_mode = (level_mode or "unchanged").strip().lower()
     if level_mode not in ("unchanged", "set", "clear"):
         raise ValueError("level mode must be unchanged, set, or clear")
@@ -1261,7 +1268,7 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
         missing_users = sorted(set(user_ids) - found_users)
         if missing_users:
             raise ValueError(f"user not found: {missing_users[0]}")
-        if role_id and not conn.execute("select id from access_roles where id = ?", (role_id,)).fetchone():
+        if role_mode == "set" and role_id and not conn.execute("select id from access_roles where id = ?", (role_id,)).fetchone():
             raise ValueError("role not found")
         if group_ids:
             group_placeholders = ",".join("?" for _ in group_ids)
@@ -1269,8 +1276,10 @@ def bulk_set_user_access(user_ids, role_id=None, group_ids=None, group_mode="rep
             missing_groups = sorted(set(group_ids) - found_groups)
             if missing_groups:
                 raise ValueError(f"group not found: {missing_groups[0]}")
-        if role_id is not None:
+        if role_mode == "set":
             conn.executemany("update portal_users set role_id = ? where id = ?", [(role_id, user_id) for user_id in user_ids])
+        elif role_mode == "clear":
+            conn.executemany("update portal_users set role_id = null where id = ?", [(user_id,) for user_id in user_ids])
         if level_mode == "set":
             conn.executemany("update portal_users set access_level = ? where id = ?", [(access_level, user_id) for user_id in user_ids])
         elif level_mode == "clear":
@@ -1334,7 +1343,7 @@ def access_policy_active():
 def subject_policy(user_id):
     with db_connect() as conn:
         row = conn.execute("""
-            select u.id, u.username, u.access_level,
+            select u.id, u.username, u.role_id, u.access_level,
                    r.can_see_all, r.can_send_all, r.can_receive_all,
                    r.can_see_own_groups, r.can_send_own_groups, r.can_receive_own_groups
             from portal_users u
@@ -1344,16 +1353,17 @@ def subject_policy(user_id):
         if not row:
             return None
         groups = {group_row["group_id"] for group_row in conn.execute("select group_id from access_user_groups where user_id = ?", (user_id,)).fetchall()}
+    has_role = row["role_id"] is not None
     return {
         "id": row["id"],
         "username": row["username"],
         "access_level": row["access_level"] if "access_level" in row.keys() else None,
-        "can_see_all": bool(row["can_see_all"]),
-        "can_send_all": bool(row["can_send_all"]),
-        "can_receive_all": bool(row["can_receive_all"]),
-        "can_see_own_groups": bool(row["can_see_own_groups"]),
-        "can_send_own_groups": bool(row["can_send_own_groups"]),
-        "can_receive_own_groups": bool(row["can_receive_own_groups"]),
+        "can_see_all": bool(row["can_see_all"]) if has_role else False,
+        "can_send_all": bool(row["can_send_all"]) if has_role else False,
+        "can_receive_all": bool(row["can_receive_all"]) if has_role else False,
+        "can_see_own_groups": bool(row["can_see_own_groups"]) if has_role else True,
+        "can_send_own_groups": bool(row["can_send_own_groups"]) if has_role else True,
+        "can_receive_own_groups": bool(row["can_receive_own_groups"]) if has_role else True,
         "groups": groups,
     }
 
@@ -1376,10 +1386,8 @@ def explain_subject_action(viewer_id, target_id, action):
     def level_allowed():
         if action == "receive":
             return (True, "level_not_applied", "Receive permission is controlled by recipient policy.")
-        viewer_level = viewer.get("access_level")
-        target_level = target.get("access_level")
-        if viewer_level is None or target_level is None:
-            return (True, "level_open", "One or both users have no access level; level filter does not block.")
+        viewer_level = viewer.get("access_level") or 1
+        target_level = target.get("access_level") or 1
         allowed = int(viewer_level) >= int(target_level)
         return (
             allowed,
@@ -2190,6 +2198,7 @@ def enrollment_row(row, base_url=""):
         "username_prefix": row["username_prefix"],
         "description": row["description"] or "",
         "role_id": row["role_id"],
+        "role_name": row_get(row, "role_name", "") or "",
         "access_level": row["access_level"],
         "group_ids": group_ids,
         "max_uses": row["max_uses"],
@@ -2212,7 +2221,12 @@ def enrollment_row(row, base_url=""):
 
 def list_field_enrollments(base_url=""):
     with db_connect() as conn:
-        rows = conn.execute("select * from field_enrollments order by id desc").fetchall()
+        rows = conn.execute("""
+            select e.*, r.name as role_name
+            from field_enrollments e
+            left join access_roles r on r.id = e.role_id
+            order by e.id desc
+        """).fetchall()
     return [enrollment_row(row, base_url) for row in rows]
 
 
@@ -5569,7 +5583,15 @@ class HttpHandler(BaseHTTPRequestHandler):
                 if not self.require_auth():
                     return
                 payload = self.read_json()
-                self.send_json(bulk_set_user_access(payload.get("user_ids", []), payload.get("role_id"), payload.get("group_ids", []), payload.get("group_mode", "replace"), payload.get("access_level"), payload.get("level_mode", "unchanged")))
+                self.send_json(bulk_set_user_access(
+                    payload.get("user_ids", []),
+                    payload.get("role_id"),
+                    payload.get("group_ids", []),
+                    payload.get("group_mode", "replace"),
+                    payload.get("access_level"),
+                    payload.get("level_mode", "unchanged"),
+                    payload.get("role_mode", "unchanged"),
+                ))
                 return
             if path == "/api/access-links/set":
                 if not self.require_auth():

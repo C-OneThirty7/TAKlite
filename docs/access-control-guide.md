@@ -1,837 +1,496 @@
 # TAKlite Access Control Guide
 
-Version: TAKlite v0.2.23
+Version: TAKlite v0.2.24
 
 ## Purpose
 
-This guide explains how TAKlite roles, groups, and visibility links work, and how an admin can use them to control who can see whom on the map and who can send data to whom.
+This guide explains how TAKlite controls who can see Position Location Information (PLI), who can send datapackages, and who can receive datapackages.
 
-TAKlite access control is designed for small teams that need simple, fast changes during training, field work, or events. The goal is to let an admin build common patterns such as:
-
-- Alpha team sees Alpha only.
-- Bravo team sees Bravo only.
-- Instructors see everyone.
-- Normal users do not see instructors unless the admin wants that.
-- Isolated users can be visible to instructors while seeing nobody.
-- Teams can be temporarily linked together and split apart again.
-
-## Quick Mental Model
-
-Think of TAKlite access control in three layers:
+The current access model is intentionally simple:
 
 ```text
-Role   = what broad powers a user has
-Group  = what team or visibility bucket a user belongs to
-Link   = whether one group can see/send to, and be received by, another group
+Team boundary first
+Level second
+Access override only when needed
+Team links only when teams should interact
 ```
 
-Each connection user can have:
+For most users, admins should assign only:
 
-- One role
-- Zero, one, or many groups
-- Visibility created by shared groups, role powers, and cross-group links
+- Team
+- Level
 
-The best workflow is:
-
-1. Create groups first.
-2. Create roles second.
-3. Assign users to roles and groups.
-4. Add links only when groups need cross-group visibility.
-5. Use Access Preview to verify the outcome.
+Most users do not need an access override.
 
 ## Default Open Mode
 
-TAKlite is open by default until an admin actually assigns access policy to users.
+TAKlite stays open until access policy is actually assigned.
 
-That means if you create connection users and do not assign any roles, groups, or group links, active users can see each other, send CoT traffic, chat, and use normal datapackage visibility. This is intentional. A simple TAKlite install should work like a normal relay without forcing the admin to build an access-control policy first.
+That means:
 
-Access rules begin shaping traffic after policy is assigned. In practice, TAKlite treats the policy as active when at least one active user has a role, at least one user is placed in a group, or at least one group link exists.
+- New server with no team assignments: users can see and send normally.
+- Teams created but nobody assigned yet: users can still see and send normally.
+- Once users are assigned to teams, team and level rules begin shaping traffic.
 
-Operationally:
+This keeps a simple TAKlite relay easy to use while still allowing controlled visibility when an admin needs it.
 
-- No roles/groups assigned: everyone sees everyone.
-- Roles/groups created but not assigned to users: everyone still sees everyone.
-- At least one user assigned a role or group: access policy is active.
-- Once policy is active, unassigned users should be treated as incomplete setup and may not see other users as expected.
-
-If you want an open server, leave users unassigned in the Access panel. If you want controlled visibility, assign every operational user to the intended role and group, then verify with Access Preview.
-
-## Important Terms
+## Core Terms
 
 ### Connection User
 
-A Connection User is a TAKlite user profile that receives a `.dp.zip` connection package for ATAK or WinTAK. These are the users who appear in the Access panel.
+A Connection User is a TAKlite user profile with an ATAK/WinTAK connection package.
 
-### Role
+Connection users are created in the `Users` panel and managed in the `Access` panel.
 
-A role defines broad permission behavior. Examples:
+### Team
 
-- Admin
-- Instructor
-- Student
-- Observer
-- Isolated
+A Team is the main visibility boundary.
 
-Role names are yours to choose. TAKlite does not require names like Instructor or Student. The behavior comes from the checkboxes assigned to the role.
-
-### Group
-
-A group is a team, class, cell, or visibility bucket. Examples:
-
-- Alpha
-- Bravo
-- Charlie
-- Staff
-- Beacon
-
-Groups are not permission levels by themselves. They are membership buckets. The permissions come from a user's role and from links between groups.
-
-### Link
-
-A link controls cross-group visibility, send ability, and receive ability.
-
-No link means groups stay isolated from each other unless a user's role has a global permission such as "Can see everyone."
-
-Links are directional:
-
-```text
-Alpha -> Bravo
-```
-
-means Alpha can see Bravo, send to Bravo, and Bravo can receive that path. Bravo does not automatically see or send to Alpha.
-
-```text
-Two Way
-```
-
-means Alpha and Bravo can see, send, and receive both directions.
-
-## Role Permissions
-
-Roles have four permission switches.
-
-### Can See Everyone
-
-This user can see all active TAKlite users, regardless of group.
-
-Use this for admins, instructors, safety monitors, or command staff.
-
-Important: this does not automatically make the admin visible to everyone else. It only controls what the admin can see.
-
-### Can Send To Everyone
-
-This user can send data to all active TAKlite users, regardless of group.
-
-Use this for admins or instructors who need to send datapackages or server-routed information to everyone.
-
-### Can See Assigned Groups
-
-This user can see other users who share at least one group with them.
-
-Use this for normal team members.
-
-Example:
-
-```text
-User A groups: Alpha
-User B groups: Alpha
-User C groups: Bravo
-```
-
-If User A has "Can see assigned groups", User A can see User B. User A cannot see User C unless Alpha and Bravo are linked or User A has "Can see everyone."
-
-### Can Send To Assigned Groups
-
-This user can send to other users who share at least one group with them.
-
-Use this for normal team members who should send datapackages or server-routed data to teammates.
-
-## Recommended Base Roles
-
-These examples are starting points. Rename them to fit your environment.
-
-### Admin Or Instructor Role
-
-Use for users who should see and send to everyone.
-
-```text
-Can see everyone:        On
-Can send to everyone:    On
-Can see assigned groups: Optional
-Can send assigned groups: Optional
-```
-
-Notes:
-
-- Admins do not need to be placed in every group.
-- Admins can see isolated groups such as Beacon even if Beacon cannot see anyone.
-- Other users do not see admins unless their own role/group/link settings allow it.
-
-### Team Member Role
-
-Use for normal users who should see and send within their own team.
-
-```text
-Can see everyone:        Off
-Can send to everyone:    Off
-Can see assigned groups: On
-Can send assigned groups: On
-```
-
-Notes:
-
-- Team members see people who share at least one group.
-- Team members do not see other teams unless the groups are linked.
-
-### Observer Role
-
-Use for users who should see their assigned group but not send to it.
-
-```text
-Can see everyone:        Off
-Can send to everyone:    Off
-Can see assigned groups: On
-Can send assigned groups: Off
-```
-
-### Isolated Role
-
-Use for users who should not see or send to anyone by default.
-
-```text
-Can see everyone:        Off
-Can send to everyone:    Off
-Can see assigned groups: Off
-Can send assigned groups: Off
-```
-
-Notes:
-
-- This is useful for Beacon, role-player, hidden target, or evaluator profiles.
-- Admins with "Can see everyone" can still see isolated users.
-- Isolated users will not see admins unless you intentionally give them visibility.
-
-## Recommended Group Patterns
-
-### Team Groups
-
-Use team groups for normal visibility:
+Examples:
 
 ```text
 Alpha
 Bravo
 Charlie
-Delta
+Staff
+Visitors
 ```
 
-Assign each user to their team group.
+Users in the same team can see, send, and receive according to their level.
 
-### Staff Or Admin Group
+Users in different teams cannot see, send, or receive across those teams unless a team link or access override allows it.
 
-Use a Staff or Admin group only when you want staff to see each other through normal group membership.
+### Level
 
-Admins do not need to be in a Staff group to see everyone if their role already has "Can see everyone."
+Levels are numeric access ranks from 1 to 4.
 
-### Beacon Or Hidden Group
-
-Use a Beacon group for users who should be visible to admins but hidden from students.
-
-Recommended:
+Levels apply only after the team path is allowed.
 
 ```text
-Beacon users:
-  Role: Isolated
-  Group: Beacon
-
-Admin users:
-  Role: Admin or Instructor
-  Group: optional
+Level 1 sees/sends to Level 1
+Level 2 sees/sends to Level 2 and Level 1
+Level 3 sees/sends to Level 3, Level 2, and Level 1
+Level 4 sees/sends to Level 4, Level 3, Level 2, and Level 1
 ```
 
-Do not link Beacon to student groups unless students should see Beacon.
+Level does not jump team boundaries.
 
-## How Visibility Is Decided
+Example:
 
-When TAKlite decides whether User A can see User B, it checks:
+```text
+Alpha Level 4 cannot see Bravo Level 1
+unless Alpha is linked to Bravo
+or the Alpha user has an access override that allows all teams.
+```
 
-1. Is User A looking at themselves? If yes, allowed.
-2. Does User A's role have "Can see everyone"? If yes, allowed.
-3. Does User A's role have "Can see assigned groups", and do User A and User B share a group? If yes, allowed.
-4. Is there a link from one of User A's groups to one of User B's groups with see enabled? If yes, allowed.
-5. Otherwise, not allowed.
+### Team User
 
-Send permission works the same way, but uses the send switches and send links. Receive permission is checked separately for datapackages, so a recipient can be allowed to see a sender while still refusing package delivery from that sender.
+`Team User` is the default access type.
 
-## How Access Levels Work
+A Team User:
 
-Access levels are optional. If a user has no level assigned, TAKlite keeps using the normal role/group/link rules.
+- Uses assigned teams as the boundary
+- Uses level for rank filtering inside allowed teams
+- Does not have global powers
 
-When levels are assigned, they act like a simple ladder inside the permissions that already exist:
+This is the correct access type for normal users.
 
-- Level 1 can see/send Level 1.
-- Level 2 can see/send Level 2 and Level 1.
-- Level 3 can see/send Level 3, Level 2, and Level 1.
-- Level 4 can see/send Level 4, Level 3, Level 2, and Level 1.
+### Access Override
 
-Receiving is not limited by the recipient's level. This allows a Level 1 user to receive a package sent by a Level 4 user when the sender, receiver, role, and group rules allow that path.
+An Access Override is an advanced template for high-trust users.
 
-Groups still matter. A Level 4 user in Alpha does not automatically see Bravo unless their role can see everyone or Alpha is linked to Bravo.
-
-Use levels when a team needs rank-based visibility inside the same group. Use roles for broad powers such as "can see everyone". Use groups for team membership.
-
-## How Datapackage Visibility Works
-
-Access control also affects datapackage visibility when enforcement is enabled.
-
-In general:
-
-- Public datapackages are visible to users.
-- Private datapackages are visible to the creator.
-- A private package from another user is visible when the requester can see the creator, the creator can send to the requester, and the requester can receive from the creator.
-- Admins with broad see/send roles can manage packages from the admin panel.
-
-Filename tags can narrow who sees a package uploaded from ATAK/WinTAK without changing the TAK client.
+Use overrides for users who need capabilities beyond normal team and level rules.
 
 Examples:
 
 ```text
-maps__lvl4ONLY.dp.zip
-maps__lvl4ALL.dp.zip
-brief__lvl4and2ONLY.dp.zip
+Controller
+Instructor
+Safety
+Admin
+Observer
 ```
 
-The tag behavior is:
+Overrides can grant broad powers such as:
 
-- `lvl4ONLY` means only Level 4 users can query/download that package.
-- `lvl4ALL` means Levels 4, 3, 2, and 1 can query/download that package.
-- `lvl4and2ONLY` means only Level 4 and Level 2 users can query/download that package.
-- Untagged packages follow the sender's normal role/group/link visibility policy.
+- See all teams
+- Send to all teams
+- Receive from all teams
+- See assigned teams
+- Send to assigned teams
+- Receive from assigned teams
 
-TAKlite still enforces the sender and receiver policy after reading the filename tag. For example, an Alpha package tagged `lvl4ONLY` is limited to allowed Level 4 users; it does not automatically cross into Bravo unless the role/group/link policy allows that path.
+Important: an override controls what that user can do. It does not automatically make that user visible to everyone else.
 
-TAKlite also prevents lower-level users from creating higher-level tagged packages. For example, a Level 2 user cannot upload a package named `brief__lvl4ONLY.dp.zip`.
+## The Most Important Rule
 
-If datapackage behavior feels unexpected, use Access Preview first. If the two users do not appear in the expected "Can See", "Can Send To", "Seen By", or "Can Receive From" lists, adjust roles/groups/links before retesting in ATAK.
+Team boundaries come first.
 
-## Admin Package Send
+Levels only apply after the team path is allowed.
 
-The Datapackages panel can upload a `.zip` or `.dp.zip` from the admin computer and can send any stored package to selected connection users.
-
-The normal workflow is:
-
-1. Open Datapackages.
-2. Upload the file, or choose an existing stored package.
-3. Use Send to select online or offline connection users.
-4. Review the send result for sent, pending, blocked, or failed targets.
-
-The admin send action checks the same rules:
-
-1. The package creator must be allowed to send to the selected user.
-2. The selected user must be allowed to receive from the package creator.
-3. Explicit recipient lists, when present, limit package query/download to the selected users and the creator.
-
-If the selected user is online, TAKlite sends the file-share notification immediately. If the selected user is offline, TAKlite records the delivery as pending and tries to push the notification when that user reconnects.
-
-The send result explains each target:
-
-- `sent` means the connected client socket accepted the file-share notification.
-- `pending_offline` means the user is allowed but not currently connected.
-- `blocked_sender_policy` means the package creator cannot send to the selected user.
-- `blocked_receive_policy` means the selected user cannot receive from the package creator.
-- `blocked_explicit_audience` means the selected user is outside that package's explicit recipient list.
-- `blocked_receive_policy` means the selected user cannot receive from the package creator.
-
-## Access Enforcement
-
-Access rules matter when Access Enforcement is on.
-
-Check this in:
+This means:
 
 ```text
-Settings -> Access Enforcement
+Team A Level 4 cannot see Team B Level 1 by level alone.
 ```
 
-Recommended production setting:
+To make Team A interact with Team B, use a Team Link or an Access Override.
+
+## Level Example
+
+Scenario:
+
+- Controller users have an override for `See all teams` and `Send to all teams`.
+- Controllers are Level 4.
+- Team A users are Team Users.
+- Team A users are Level 1.
+
+Result:
+
+- Controllers can see Team A users.
+- Controllers can send to Team A users.
+- Team A users cannot see Controllers unless their own team/link/override/level path allows it.
+- Team A users cannot send to Controllers unless their own policy allows it.
+
+This supports the common pattern:
 
 ```text
-Access Enforcement: On
+High-trust users see everyone.
+Normal users do not automatically see high-trust users.
 ```
 
-If Access Enforcement is off, the Access panel can still be configured, but TAKlite will not fully apply the policy to live traffic and package visibility. Use off only for testing or troubleshooting.
+## Team Links
 
-## The Access Panel
+Team Links connect separate teams.
 
-Open:
+No link means separate teams stay separate.
+
+Team links can be one-way or two-way.
+
+### No Link
 
 ```text
-TAKlite Admin -> Access
+Alpha    Bravo
 ```
 
-The panel is organized into these sections.
+Alpha and Bravo stay isolated.
 
-### User Membership
-
-Use this to edit one user at a time.
-
-For each user, choose:
-
-- Role
-- One or more groups
-
-Click Save for that user.
-
-Use this when correcting one profile or verifying a special user.
-
-### Bulk Membership
-
-Use this for normal administration.
-
-Bulk Membership lets you:
-
-- Filter users by username, display name, role, or group
-- Select many users
-- Apply one role to the selected users
-- Replace, add, or remove groups for the selected users
-
-Group actions:
+### One-Way Link
 
 ```text
-Replace groups = remove current groups and set exactly the selected groups
-Add groups     = keep current groups and add the selected groups
-Remove groups  = remove only the selected groups
+Alpha -> Bravo
 ```
 
-Use Replace when assigning a class or team from scratch. Use Add when temporarily adding users to another team. Use Remove when ending a temporary assignment.
+Alpha users can interact with Bravo users according to level.
 
-### Access Preview
+Bravo users do not automatically interact with Alpha users.
 
-Access Preview is the most important verification tool.
-
-Pick a user and check:
+### Two-Way Link
 
 ```text
-Can See
-Can Send To
-Seen By
-Can Receive From
+Alpha <-> Bravo
 ```
 
-Use this before handing devices to users.
+Both teams can interact according to level.
 
-### Role Permissions
+## Datapackage Behavior
 
-Create or edit roles here.
+TAKlite enforces the same access policy on datapackage search, query, download, and plugin-controlled send operations.
 
-Role changes affect every user with that role.
+The backend policy is the failsafe:
 
-### Groups
+- If a user should not see a package, it should not appear in their query/search results.
+- If a user tries to download a blocked package, TAKlite should deny it.
+- If a user sends through the Axon plugin, TAKlite checks the requested audience before delivery.
 
-Create or edit groups here.
+The Axon plugin can provide a pre-send review, but TAKlite still enforces policy server-side.
 
-Group changes affect membership buckets. Deleting a group removes membership and links for that group.
+## Recommended Admin Workflow
 
-### Visibility Links
+Use this order:
 
-Use this only when separate groups need cross-group access.
+1. Create teams.
+2. Create users.
+3. Bulk assign users to teams.
+4. Bulk set levels.
+5. Leave most users as `Team User`.
+6. Create access overrides only for controller/admin-style users.
+7. Link teams only when cross-team interaction is needed.
+8. Use Access Preview before field testing.
 
-Available modes for each pair:
+## Creating Users
+
+In `Users`:
+
+1. Create a single user or bulk users.
+2. Leave `Access type` as `Team User (default)` unless the user needs special powers.
+3. Set the user's level, usually Level 1 for normal users.
+4. Assign teams directly during creation or later in `Access`.
+
+TAKlite learns IP/device details from TAK/Axon traffic when possible. Admins can edit those fields later if needed.
+
+## Bulk Membership
+
+`Bulk Membership` is the primary admin workflow for many users.
+
+Use it to:
+
+- Select several users at once
+- Replace/add/remove teams
+- Set levels
+- Set an access override
+- Clear an access override back to Team User
+
+### Bulk Access Type Actions
 
 ```text
-No Link       = neither group gets cross-group access
-Alpha -> Bravo = Alpha can see/send Bravo
-Bravo -> Alpha = Bravo can see/send Alpha
-Two Way       = both groups can see/send each other
+Leave access type unchanged
 ```
 
-## Example 1: Two Student Teams, Instructors See All
+Does not change whether selected users are Team Users or have an override.
+
+```text
+Set to Team User
+```
+
+Clears any existing access override.
+
+```text
+Set override
+```
+
+Applies the selected access override.
+
+### Bulk Team Actions
+
+```text
+Replace teams
+```
+
+Removes existing team membership and applies the selected teams.
+
+```text
+Add teams
+```
+
+Keeps existing teams and adds the selected teams.
+
+```text
+Remove teams
+```
+
+Removes only the selected teams.
+
+## Individual Membership
+
+Use `Individual Membership` when one user needs a manual correction.
+
+You can edit:
+
+- Access type
+- Level
+- Teams
+
+Use this for cleanup, not primary onboarding.
+
+## Access Preview
+
+Access Preview is the admin's sanity check.
+
+Pick a user and verify:
+
+- Who they can see
+- Who they can send to
+- Who can see them
+- Who can send to them
+
+Use Access Preview before issuing users their final connection packages.
+
+## Example 1: Two Isolated Teams
 
 Goal:
 
 - Alpha sees Alpha only.
 - Bravo sees Bravo only.
-- Instructors see Alpha and Bravo.
-- Students do not see instructors.
 
-Create roles:
+Setup:
 
 ```text
-Instructor:
-  Can see everyone: On
-  Can send to everyone: On
-  Can see assigned groups: Off or On
-  Can send assigned groups: Off or On
+Teams:
+  Alpha
+  Bravo
 
-Student:
-  Can see everyone: Off
-  Can send to everyone: Off
-  Can see assigned groups: On
-  Can send assigned groups: On
-```
+Alpha users:
+  Access type: Team User
+  Team: Alpha
+  Level: 1
 
-Create groups:
+Bravo users:
+  Access type: Team User
+  Team: Bravo
+  Level: 1
 
-```text
-Alpha
-Bravo
-```
-
-Assign users:
-
-```text
-Lead Admin:
-  Role: Instructor
-  Groups: none, or Staff if you want staff grouping
-
-Assistant Admin:
-  Role: Instructor
-  Groups: none, or Staff
-
-Alpha students:
-  Role: Student
-  Groups: Alpha
-
-Bravo students:
-  Role: Student
-  Groups: Bravo
-```
-
-Links:
-
-```text
-Alpha <-> Bravo: No Link
-```
-
-Preview:
-
-- Lead Admin can see everyone.
-- Assistant Admin can see everyone.
-- Alpha students can see Alpha students.
-- Bravo students can see Bravo students.
-- Alpha students cannot see Bravo students.
-- Students do not see Lead Admin or Assistant Admin unless you put Lead Admin/Assistant Admin into a group visible to students.
-
-## Example 2: Temporarily Merge Alpha And Bravo
-
-Goal:
-
-- Alpha and Bravo usually stay separate.
-- During one exercise, they should see and send to each other.
-- After the exercise, split them again.
-
-Keep roles and groups the same.
-
-During the exercise:
-
-```text
-Visibility Links:
-  Alpha <-> Bravo: Two Way
-```
-
-After the exercise:
-
-```text
-Visibility Links:
-  Alpha <-> Bravo: No Link
-```
-
-This is faster than moving every user into a new group.
-
-## Example 3: One-Way Visibility
-
-Goal:
-
-- Alpha can see/send Bravo.
-- Bravo cannot see/send Alpha.
-
-Use:
-
-```text
-Visibility Links:
-  Alpha -> Bravo
-```
-
-This can be useful when one group is supervising another but should not be exposed in reverse.
-
-Preview:
-
-- An Alpha user should list Bravo users under Can See and Can Send To.
-- A Bravo user should not list Alpha users unless another role or group rule allows it.
-
-## Example 4: Beacon Group
-
-Goal:
-
-- Beacons do not see anyone.
-- Students do not see Beacons.
-- Instructors see Beacons.
-- Sometimes students may see Beacons.
-
-Create roles:
-
-```text
-Instructor:
-  Can see everyone: On
-  Can send to everyone: On
-
-Student:
-  Can see assigned groups: On
-  Can send assigned groups: On
-
-Beacon:
-  Can see everyone: Off
-  Can send everyone: Off
-  Can see assigned groups: Off
-  Can send assigned groups: Off
-```
-
-Create groups:
-
-```text
-Alpha
-Bravo
-Beacon
-```
-
-Assign users:
-
-```text
-Beacon users:
-  Role: Beacon
-  Groups: Beacon
-
-Students:
-  Role: Student
-  Groups: Alpha or Bravo
-
-Instructors:
-  Role: Instructor
-  Groups: optional
-```
-
-Links:
-
-```text
-Beacon <-> Alpha: No Link
-Beacon <-> Bravo: No Link
-Alpha <-> Bravo: whatever the exercise needs
+Team links:
+  none
 ```
 
 Result:
 
-- Beacons see nobody.
-- Students do not see Beacons.
-- Instructors see Beacons because Instructor can see everyone.
+- Alpha users see Alpha users.
+- Bravo users see Bravo users.
+- Alpha and Bravo do not see each other.
 
-To temporarily let Alpha see Beacons:
-
-```text
-Visibility Links:
-  Alpha -> Beacon
-```
-
-To let Beacons see Alpha too:
-
-```text
-Visibility Links:
-  Alpha <-> Beacon: Two Way
-```
-
-Most of the time, use one-way from students to Beacon only if the Beacon should appear on the map but not receive student visibility in return.
-
-## Example 5: Staff See Staff, Students Do Not See Staff
+## Example 2: Controllers See Everyone
 
 Goal:
 
-- Staff can see each other.
-- Staff can see all students.
-- Students see only their own teams.
-- Students do not see staff.
+- Controllers see all teams.
+- Normal users do not see controllers.
 
-Create roles:
+Setup:
 
 ```text
-Staff:
-  Can see everyone: On
-  Can send everyone: On
+Access override:
+  Name: Controller
+  See all teams: On
+  Send to all teams: On
+  Receive from all teams: On
 
-Student:
-  Can see assigned groups: On
-  Can send assigned groups: On
+Controller users:
+  Access type: Controller
+  Level: 4
+  Team: optional
+
+Normal users:
+  Access type: Team User
+  Level: 1
+  Team: Alpha or Bravo
 ```
 
-Create groups:
+Result:
+
+- Controllers see Alpha and Bravo.
+- Controllers can send to Alpha and Bravo.
+- Alpha/Bravo users do not automatically see controllers.
+
+## Example 3: Temporary Cross-Team Visibility
+
+Goal:
+
+- Alpha and Bravo are normally isolated.
+- For one event, Alpha and Bravo need to interact.
+
+Setup:
 
 ```text
-Staff
-Alpha
-Bravo
+Before event:
+  No link between Alpha and Bravo
+
+During event:
+  Team Link: Alpha <-> Bravo
+
+After event:
+  Set link back to No Link
 ```
 
-Assign:
+Result:
+
+- Teams can be merged or split without editing every user.
+- Levels still apply across the linked path.
+
+## Example 4: One-Way Observation
+
+Goal:
+
+- Staff can see Student Team.
+- Student Team cannot see Staff.
+
+Setup:
 
 ```text
 Staff users:
-  Role: Staff
-  Groups: Staff
+  Access type: Controller or Staff override
+  Level: 4
 
-Alpha students:
-  Role: Student
-  Groups: Alpha
-
-Bravo students:
-  Role: Student
-  Groups: Bravo
+Student users:
+  Access type: Team User
+  Team: Student Team
+  Level: 1
 ```
 
-Links:
+Result:
+
+- Staff sees students.
+- Students do not see staff.
+
+Alternate setup:
 
 ```text
-Staff <-> Alpha: No Link
-Staff <-> Bravo: No Link
-Alpha <-> Bravo: No Link unless needed
+Teams:
+  Staff
+  Student Team
+
+Team Link:
+  Staff -> Student Team
 ```
 
-Why this works:
+This keeps Staff as Team Users but still allows one-way team visibility.
 
-- Staff can see everyone because of the Staff role.
-- Staff can see other staff because they also share the Staff group.
-- Students cannot see Staff because students do not share the Staff group and no student group links to Staff.
-
-## Example 6: Multi-Group User
+## Example 5: Mixed Levels Inside One Team
 
 Goal:
 
-- One user should participate in Alpha and Bravo.
+- Team Lead sees everyone in Alpha.
+- Alpha members do not all see the Team Lead.
 
-Assign:
+Setup:
 
 ```text
-Role: Team Member
-Groups: Alpha, Bravo
+Team Lead:
+  Access type: Team User
+  Team: Alpha
+  Level: 4
+
+Alpha normal users:
+  Access type: Team User
+  Team: Alpha
+  Level: 1
 ```
 
-With "Can see assigned groups" enabled, that user can see members of both Alpha and Bravo because they share a group with both teams.
+Result:
 
-Use this for liaison users, floaters, or instructors who should behave like normal team members in multiple groups.
+- Team Lead sees all Alpha users.
+- Level 1 users see other Level 1 users.
+- Level 1 users do not see the Level 4 Team Lead.
 
 ## Common Mistakes
 
-### Mistake: Linking Groups When A Role Is Enough
+### Mistake: Giving Everyone An Override
 
-If an instructor needs to see everyone, give the instructor role "Can see everyone." Do not put instructors in every student group unless students should also see instructors.
+Most users should be Team Users.
 
-### Mistake: Expecting Links To Be Two-Way
+Use overrides only for users who need broad power.
 
-`Alpha -> Bravo` is one-way. Use Two Way if both groups should see and send to each other.
+### Mistake: Expecting Level To Cross Teams
 
-### Mistake: Giving Beacon Users Team Member Permissions
+Level does not cross teams by itself.
 
-If Beacon users have "Can see assigned groups" and share a group with students, they may see students. For isolated behavior, give Beacon users an isolated role.
+Use Team Links or an override for cross-team behavior.
 
-### Mistake: Forgetting Access Enforcement
+### Mistake: Forgetting Access Preview
 
-If Access Enforcement is off, your policy may look right in the GUI but not be fully applied. Keep Access Enforcement on for real use.
+Always preview one representative user from each team before field use.
 
-### Mistake: Not Using Access Preview
+## Quick Checklist
 
-Always preview at least one user from each group after making changes.
+Before handing out connection packages:
 
-## Recommended Admin Workflow
+- Teams created
+- Users assigned to correct teams
+- Users assigned to correct levels
+- Normal users left as Team User
+- Controller/admin users given the intended override
+- Team links set only where needed
+- Access Preview checked for each team
+- Test two real TAK clients before scaling up
 
-For a new event:
-
-1. Create roles:
-   - Admin or Instructor
-   - Team Member or Student
-   - Isolated or Beacon if needed
-2. Create groups:
-   - Alpha
-   - Bravo
-   - Staff if staff should see each other as a group
-   - Beacon if needed
-3. Create or bulk create Connection Users.
-4. Use Bulk Membership to assign roles and groups.
-5. Set Visibility Links.
-6. Use Access Preview.
-7. Test with two devices before distributing all credentials.
-
-For a live change:
-
-1. Use Bulk Membership to move users or add a temporary group.
-2. Use Visibility Links for temporary team merges.
-3. Use Access Preview.
-4. Refresh connected TAK clients if behavior does not update immediately.
-
-## Troubleshooting Checklist
-
-If a user cannot see another user:
-
-1. Is Access Enforcement on?
-2. Is the target user active and connected?
-3. Does the viewer have "Can see everyone"?
-4. Do both users share a group and does the viewer role have "Can see assigned groups"?
-5. Is there a directional link from the viewer's group to the target's group?
-6. Does Access Preview show the target under Can See?
-
-If a user cannot send to another user:
-
-1. Does the sender have "Can send everyone"?
-2. Do both users share a group and does the sender role have "Can send assigned groups"?
-3. Is there a directional link from the sender's group to the receiver's group?
-4. Does Access Preview show the receiver under Can Send To?
-
-If a user cannot receive from another user:
-
-1. Does the receiver have "Can receive everyone"?
-2. Do both users share a group and does the receiver role have "Can receive assigned groups"?
-3. Is there a directional link from the sender's group to the receiver's group?
-4. Does Access Preview show the sender under Can Receive From?
-
-If datapackage search or download is confusing:
-
-1. Check whether the package is public or private.
-2. Check who created it.
-3. Preview whether the requester can see the creator.
-4. Preview whether the creator can send to the requester.
-5. Preview whether the requester can receive from the creator.
-6. Test admin panel package send if needed.
-
-## Field-Test Matrix
-
-Before an event, test one device per policy type.
-
-| Test | Expected Result |
-| --- | --- |
-| Alpha user previews Alpha user | Can See and Can Send To |
-| Alpha user previews Bravo user with no link | Not visible |
-| Instructor previews Alpha user | Visible |
-| Alpha user previews Instructor | Not visible unless intentionally configured |
-| Beacon previews Student | Not visible |
-| Instructor previews Beacon | Visible |
-| Alpha -> Beacon link enabled | Alpha sees Beacon |
-| Alpha <-> Bravo Two Way enabled | Alpha and Bravo see/send/receive both directions |
-
-## Recommended Defaults
-
-For most events:
-
-```text
-Access Enforcement: On
-
-Roles:
-  Instructor: see everyone, send everyone
-  Student: see assigned groups, send assigned groups
-  Beacon: no see/send permissions
-
-Groups:
-  Alpha
-  Bravo
-  Beacon if needed
-  Staff only if staff should share a staff group
-
-Links:
-  No links by default
-  Add temporary links only when teams should interact
-```
-
-Keep the structure simple. Most deployments only need two or three roles and a handful of groups.

@@ -220,6 +220,44 @@ class AccessControlTests(unittest.TestCase):
         self.assertFalse(self.service.can_subject_send(level_two["id"], level_four["id"]))
         self.assertTrue(self.service.can_subject_send(level_four["id"], level_one["id"]))
 
+    def test_team_membership_is_boundary_and_no_role_defaults_to_team_user(self):
+        alpha = self.service.create_access_group("Alpha")
+        bravo = self.service.create_access_group("Bravo")
+
+        alpha_one = self.service.create_policy_subject("alpha-one", group_ids=[alpha["id"]], access_level=1)
+        alpha_four = self.service.create_policy_subject("alpha-four", group_ids=[alpha["id"]], access_level=4)
+        bravo_one = self.service.create_policy_subject("bravo-one", group_ids=[bravo["id"]], access_level=1)
+
+        self.assertTrue(self.service.can_subject_see(alpha_four["id"], alpha_one["id"]))
+        self.assertFalse(self.service.can_subject_see(alpha_one["id"], alpha_four["id"]))
+        self.assertFalse(self.service.can_subject_see(alpha_four["id"], bravo_one["id"]))
+
+        self.service.set_policy_link(alpha["id"], bravo["id"], can_see=True, can_send=True, can_receive=True)
+
+        self.assertTrue(self.service.can_subject_see(alpha_four["id"], bravo_one["id"]))
+        self.assertFalse(self.service.can_subject_see(bravo_one["id"], alpha_four["id"]))
+
+    def test_missing_access_level_defaults_to_level_one_when_policy_is_active(self):
+        alpha = self.service.create_access_group("Alpha")
+
+        no_level = self.service.create_policy_subject("alpha-unset", group_ids=[alpha["id"]])
+        level_two = self.service.create_policy_subject("alpha-two", group_ids=[alpha["id"]], access_level=2)
+
+        self.assertFalse(self.service.can_subject_see(no_level["id"], level_two["id"]))
+        self.assertTrue(self.service.can_subject_see(level_two["id"], no_level["id"]))
+
+    def test_bulk_access_can_clear_override_to_team_user(self):
+        controller = self.service.create_access_role("Controller", can_see_all=True, can_send_all=True, can_receive_all=True)
+        alpha = self.service.create_access_group("Alpha")
+        user = self.service.create_policy_subject("alpha-one", role_id=controller["id"], group_ids=[alpha["id"]], access_level=4)
+
+        self.service.bulk_set_user_access([user["id"]], role_mode="clear", access_level=1, level_mode="set")
+        updated = self.service.attach_access_to_users([self.service.portal_user_row(self.service.find_portal_user(user["id"]))])[0]
+
+        self.assertIsNone(updated["role_id"])
+        self.assertFalse(updated["role_name"])
+        self.assertEqual(updated["access_level"], 1)
+
     def test_level_tagged_datapackage_filters_after_sender_policy(self):
         participant = self.service.create_access_role("Participant", can_see_own_groups=True, can_send_own_groups=True)
         observer = self.service.create_access_role("Observer", can_see_all=True, can_send_all=True)

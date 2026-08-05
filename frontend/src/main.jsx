@@ -747,7 +747,7 @@ function SettingsPanel({ health, wgUrl, session, load, setStatus }) {
               <SettingsInput label="TLS CoT Port" type="number" value={settingsForm.cot_tls_host_port} onChange={(value) => setField('cot_tls_host_port', Number(value))} detail="Certificate-backed CoT relay." />
             </div>
             <div className="toggle-grid">
-              <SettingsToggle label="Access Enforcement" checked={settingsForm.access_control_enforce} onChange={(value) => setField('access_control_enforce', value)} detail="Apply role and group rules to CoT and packages." />
+              <SettingsToggle label="Access Enforcement" checked={settingsForm.access_control_enforce} onChange={(value) => setField('access_control_enforce', value)} detail="Apply team, link, level, and override rules to CoT and packages." />
               <SettingsToggle label="Require Client Certs" checked={settingsForm.cot_tls_require_client_cert} onChange={(value) => setField('cot_tls_require_client_cert', value)} detail="Require per-user TLS identity for TLS CoT." />
               <SettingsToggle label="Allow Legacy Cert CN" checked={settingsForm.allow_legacy_client_cert} onChange={(value) => setField('allow_legacy_client_cert', value)} detail="Allow old shared certificate identities." />
             </div>
@@ -1228,7 +1228,7 @@ function PackagePolicyPanel({ pkg, session, load, setStatus, onClose }) {
           ))}
         </div>
       ) : (
-        <PanelHint>Untagged/default behavior: the package follows the creator&apos;s normal role, group, link, and level policy.</PanelHint>
+        <PanelHint>Untagged/default behavior: the package follows the creator&apos;s normal team, link, level, and access-override policy.</PanelHint>
       )}
       <div className="send-actions">
         <button className="btn primary" type="button" onClick={save} disabled={mode !== 'sender' && !levels.length}><ShieldCheck size={16} />Apply Policy</button>
@@ -1267,7 +1267,7 @@ function PackageAccessPreviewPanel({ pkg, session, setStatus, onClose }) {
               <div className={item.allowed ? 'package-preview-row allowed' : 'package-preview-row blocked'} key={item.user_id}>
                 <span>
                   <strong>{item.username}</strong>
-                  <small>{item.role_name || 'no role'}{item.access_level ? ` / Level ${item.access_level}` : ' / no level'}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
+                  <small>{item.role_name || 'Team User'} / {accessLevelName(item.access_level)}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
                 </span>
                 <Badge tone={item.allowed ? 'good' : 'warn'}>{item.allowed ? 'allowed' : 'blocked'}</Badge>
                 <small>{item.reason}</small>
@@ -1373,38 +1373,38 @@ async function deletePackage(pkg, session, load, setStatus) {
 }
 
 async function editRole(role, session, load, setStatus) {
-  const name = prompt(`Role name`, role.name);
+  const name = prompt(`Override name`, role.name);
   if (name === null) return;
   const description = prompt(`Description for ${name}`, role.description || '');
   if (description === null) return;
   await api('/api/access-roles/update', session, { method: 'POST', body: JSON.stringify({ ...role, name, description }) });
-  setStatus('Role updated.');
+  setStatus('Override updated.');
   await load();
 }
 
 async function deleteRole(role, session, load, setStatus) {
-  if (!confirm(`Delete role ${role.name}? Users with this role will keep their groups but lose the role.`)) return;
+  if (!confirm(`Delete override ${role.name}? Users with this override will keep their teams and level, but return to Team User behavior.`)) return;
   await api('/api/access-roles/delete', session, { method: 'POST', body: JSON.stringify({ id: role.id }) });
-  setStatus('Role deleted.');
+  setStatus('Override deleted.');
   await load();
 }
 
 async function editGroup(group, session, load, setStatus) {
-  const name = prompt(`Group name`, group.name);
+  const name = prompt(`Team name`, group.name);
   if (name === null) return;
   const description = prompt(`Description for ${name}`, group.description || '');
   if (description === null) return;
   const color = prompt(`Hex color for ${name}`, group.color || '#64c18c');
   if (color === null) return;
   await api('/api/access-groups/update', session, { method: 'POST', body: JSON.stringify({ ...group, name, description, color }) });
-  setStatus('Group updated.');
+  setStatus('Team updated.');
   await load();
 }
 
 async function deleteGroup(group, session, load, setStatus) {
-  if (!confirm(`Delete group ${group.name}? Membership and links for this group will be removed.`)) return;
+  if (!confirm(`Delete team ${group.name}? Membership and links for this team will be removed.`)) return;
   await api('/api/access-groups/delete', session, { method: 'POST', body: JSON.stringify({ id: group.id }) });
-  setStatus('Group deleted.');
+  setStatus('Team deleted.');
   await load();
 }
 
@@ -1438,10 +1438,18 @@ function AccessLevelSelect({ value, onChange, emptyLabel = 'No level' }) {
   );
 }
 
+function accessTypeName(user) {
+  return user?.role_name || 'Team User';
+}
+
+function accessLevelName(value) {
+  return `Level ${value || 1}`;
+}
+
 function CreateUser({ access, session, load, setStatus }) {
   const roles = access?.roles || [];
   const groups = access?.groups || [];
-  const blankForm = { username: '', password: '', description: '', allow_redownload: false, role_id: '', access_level: '', group_ids: [] };
+  const blankForm = { username: '', password: '', description: '', allow_redownload: false, role_id: '', access_level: '1', group_ids: [] };
   const [form, setForm] = useState(blankForm);
   const toggleGroup = (id) => {
     const groupIds = new Set(form.group_ids);
@@ -1461,11 +1469,12 @@ function CreateUser({ access, session, load, setStatus }) {
       <label>Username<input value={form.username} onChange={(e) => setForm({ ...form, username: e.target.value })} placeholder="alpha-phone" /></label>
       <label>Password<input type="password" value={form.password} onChange={(e) => setForm({ ...form, password: e.target.value })} placeholder="Download password" /></label>
       <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
-      <label>Role<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
-        <option value="">No role</option>
+      <label>Access type<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
+        <option value="">Team User (default)</option>
         {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
       </select></label>
       <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
+      <span className="form-note">Team User follows team membership and level rules. Use an override only for controller/admin-style accounts.</span>
       <div className="group-picks compact">
         {groups.map((group) => (
           <label className="check group-chip" key={group.id}>
@@ -1484,7 +1493,7 @@ function CreateUser({ access, session, load, setStatus }) {
 function CreateBulkUsers({ access, session, load, setStatus }) {
   const roles = access?.roles || [];
   const groups = access?.groups || [];
-  const [form, setForm] = useState({ prefix: 'user', count: 20, description: '', allow_redownload: false, role_id: '', access_level: '', group_ids: [] });
+  const [form, setForm] = useState({ prefix: 'user', count: 20, description: '', allow_redownload: false, role_id: '', access_level: '1', group_ids: [] });
   const [result, setResult] = useState(null);
   const [busy, setBusy] = useState(false);
   const toggleGroup = (id) => {
@@ -1513,8 +1522,8 @@ function CreateBulkUsers({ access, session, load, setStatus }) {
         <label>Name prefix<input value={form.prefix} onChange={(e) => setForm({ ...form, prefix: e.target.value })} placeholder="user" /></label>
         <label>Number<input type="number" min="1" max="100" value={form.count} onChange={(e) => setForm({ ...form, count: e.target.value })} /></label>
         <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
-        <label>Role<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
-          <option value="">No role</option>
+        <label>Access type<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
+          <option value="">Team User (default)</option>
           {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
         </select></label>
         <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
@@ -1580,7 +1589,7 @@ function CreateBulkUsers({ access, session, load, setStatus }) {
 function FieldEnrollmentPanel({ enrollments, access, session, load, setStatus }) {
   const roles = access?.roles || [];
   const groups = access?.groups || [];
-  const [form, setForm] = useState({ name: 'Field Enrollment', username_prefix: 'field-user', description: '', expires_in_hours: 24, max_uses: 1, role_id: '', access_level: '', group_ids: [] });
+  const [form, setForm] = useState({ name: 'Field Enrollment', username_prefix: 'field-user', description: '', expires_in_hours: 24, max_uses: 1, role_id: '', access_level: '1', group_ids: [] });
   const [busy, setBusy] = useState(false);
   const toggleGroup = (id) => {
     const groupIds = new Set(form.group_ids);
@@ -1607,8 +1616,8 @@ function FieldEnrollmentPanel({ enrollments, access, session, load, setStatus })
         <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
         <label>Expires in hours<input type="number" min="1" max="720" value={form.expires_in_hours} onChange={(e) => setForm({ ...form, expires_in_hours: Number(e.target.value) })} /></label>
         <label>Max uses<input type="number" min="1" max="100" value={form.max_uses} onChange={(e) => setForm({ ...form, max_uses: Number(e.target.value) })} /></label>
-        <label>Role<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
-          <option value="">No role</option>
+        <label>Access type<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
+          <option value="">Team User (default)</option>
           {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
         </select></label>
         <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} /></label>
@@ -1651,7 +1660,7 @@ function FieldEnrollmentTable({ enrollments, session, load, setStatus }) {
               <td><strong>{item.name}</strong><span>{item.description || item.username_prefix}</span></td>
               <td><Badge tone={item.active ? 'good' : 'warn'}>{item.revoked ? 'revoked' : item.expired ? 'expired' : item.active ? 'active' : 'used'}</Badge></td>
               <td><code>{item.join_code}</code><br /><code>{item.join_url || `${location.origin}${item.join_path}`}</code></td>
-              <td><span>Role {item.role_id || 'none'}</span><span>Level {item.access_level || 'none'}</span><span>{(item.group_ids || []).length} group(s)</span></td>
+              <td><span>{item.role_name || 'Team User'}</span><span>{accessLevelName(item.access_level)}</span><span>{(item.group_ids || []).length} team(s)</span></td>
               <td>{item.used_count || 0} / {item.max_uses || 0}</td>
               <td>{fmtTime(item.expires_at)}</td>
               <td>
@@ -1676,31 +1685,34 @@ function AccessPanel({ users, access, session, load, setStatus }) {
   const links = access?.links || [];
   return (
     <div className="dashboard-grid">
+      <Panel title="Teams" icon={Users}>
+        <PanelHint>Teams are the primary boundary. Users in the same team can exchange PLI and packages according to their level.</PanelHint>
+        <CreateGroup session={session} load={load} setStatus={setStatus} />
+        <GroupsTable groups={groups} session={session} load={load} setStatus={setStatus} />
+      </Panel>
       <Panel title="Bulk Membership" icon={Users} wide>
-        <PanelHint>Select multiple users, then apply role, level, or group changes to the whole selection.</PanelHint>
+        <PanelHint>Select users, assign their teams, set their level, and optionally add or clear an access override.</PanelHint>
         <BulkAccess users={users} roles={roles} groups={groups} session={session} load={load} setStatus={setStatus} />
       </Panel>
       <Panel title="Individual Membership" icon={UserPlus} wide>
-        <PanelHint>Fine-tune one user&apos;s role, level, and group membership after the bulk pass.</PanelHint>
+        <PanelHint>Fine-tune one user&apos;s team, level, and optional override after the bulk pass.</PanelHint>
         <UserAccessTable users={users} roles={roles} groups={groups} session={session} load={load} setStatus={setStatus} />
       </Panel>
       <Panel title="Access Preview" icon={ShieldCheck} wide>
         <PanelHint>Pick a user to verify who they can see, who can see them, and send permissions before testing on devices.</PanelHint>
         <AccessPreview users={users} session={session} setStatus={setStatus} />
       </Panel>
-      <Panel title="Role Templates" icon={ShieldCheck}>
-        <PanelHint>Roles are reusable permission templates. A high-trust role can see everyone without becoming visible to everyone else.</PanelHint>
-        <CreateRole session={session} load={load} setStatus={setStatus} />
-        <RolesTable roles={roles} session={session} load={load} setStatus={setStatus} />
-      </Panel>
-      <Panel title="Teams / Groups" icon={Users}>
-        <PanelHint>Groups are the normal team buckets users belong to. Users in the same group can see/send/receive when their role allows assigned-group access.</PanelHint>
-        <CreateGroup session={session} load={load} setStatus={setStatus} />
-        <GroupsTable groups={groups} session={session} load={load} setStatus={setStatus} />
-      </Panel>
       <Panel title="Team Links" icon={Link2} wide>
-        <PanelHint>Links connect separate groups. No link means groups stay isolated unless a role has global see/send/receive permissions.</PanelHint>
+        <PanelHint>Links connect separate teams. No link means teams stay isolated. Levels still apply after a link allows the team path.</PanelHint>
         <GroupLinks groups={groups} links={links} session={session} load={load} setStatus={setStatus} />
+      </Panel>
+      <Panel title="Advanced Overrides" icon={ShieldCheck} wide>
+        <PanelHint>Most users should stay Team User. Create overrides only for controller/admin-style accounts that need global visibility or receive power.</PanelHint>
+        <details className="advanced-access">
+          <summary>Show override templates</summary>
+          <CreateRole session={session} load={load} setStatus={setStatus} />
+          <RolesTable roles={roles} session={session} load={load} setStatus={setStatus} />
+        </details>
       </Panel>
     </div>
   );
@@ -1760,7 +1772,7 @@ function PreviewList({ title, items }) {
       {items?.length ? items.map((item) => (
         <div className="preview-user" key={`${title}-${item.id}`}>
           <span>{item.username}</span>
-          <small>{item.role_name || 'no role'}{item.access_level ? ` / Level ${item.access_level}` : ''}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
+          <small>{item.role_name || 'Team User'} / {accessLevelName(item.access_level)}{(item.groups || []).length ? ` / ${item.groups.map((group) => group.name).join(', ')}` : ''}</small>
         </div>
       )) : <span className="hint">None</span>}
     </div>
@@ -1782,57 +1794,57 @@ function CreateRole({ session, load, setStatus }) {
     event.preventDefault();
     try {
       await api('/api/access-roles/create', session, { method: 'POST', body: JSON.stringify(form) });
-      setStatus(`Role ${form.name} created.`);
+      setStatus(`Override ${form.name} created.`);
       setForm({ name: '', description: '', can_see_all: false, can_send_all: false, can_receive_all: false, can_see_own_groups: true, can_send_own_groups: true, can_receive_own_groups: true });
       await load();
     } catch (error) {
-      setStatus(`Role create failed: ${error.message}`);
+      setStatus(`Override create failed: ${error.message}`);
     }
   };
   return (
     <form className="access-create" onSubmit={submit}>
-      <label>Role name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Supervisor" /></label>
+      <label>Override name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Controller" /></label>
       <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
       <div className="check-row">
-        <label className="check"><input type="checkbox" checked={form.can_see_all} onChange={(e) => setForm({ ...form, can_see_all: e.target.checked })} /> Can see everyone</label>
-        <label className="check"><input type="checkbox" checked={form.can_send_all} onChange={(e) => setForm({ ...form, can_send_all: e.target.checked })} /> Can send to everyone</label>
-        <label className="check"><input type="checkbox" checked={form.can_receive_all} onChange={(e) => setForm({ ...form, can_receive_all: e.target.checked })} /> Can receive from everyone</label>
-        <label className="check"><input type="checkbox" checked={form.can_see_own_groups} onChange={(e) => setForm({ ...form, can_see_own_groups: e.target.checked })} /> Can see assigned groups</label>
-        <label className="check"><input type="checkbox" checked={form.can_send_own_groups} onChange={(e) => setForm({ ...form, can_send_own_groups: e.target.checked })} /> Can send to assigned groups</label>
-        <label className="check"><input type="checkbox" checked={form.can_receive_own_groups} onChange={(e) => setForm({ ...form, can_receive_own_groups: e.target.checked })} /> Can receive from assigned groups</label>
+        <label className="check"><input type="checkbox" checked={form.can_see_all} onChange={(e) => setForm({ ...form, can_see_all: e.target.checked })} /> See all teams</label>
+        <label className="check"><input type="checkbox" checked={form.can_send_all} onChange={(e) => setForm({ ...form, can_send_all: e.target.checked })} /> Send to all teams</label>
+        <label className="check"><input type="checkbox" checked={form.can_receive_all} onChange={(e) => setForm({ ...form, can_receive_all: e.target.checked })} /> Receive from all teams</label>
+        <label className="check"><input type="checkbox" checked={form.can_see_own_groups} onChange={(e) => setForm({ ...form, can_see_own_groups: e.target.checked })} /> See assigned teams</label>
+        <label className="check"><input type="checkbox" checked={form.can_send_own_groups} onChange={(e) => setForm({ ...form, can_send_own_groups: e.target.checked })} /> Send to assigned teams</label>
+        <label className="check"><input type="checkbox" checked={form.can_receive_own_groups} onChange={(e) => setForm({ ...form, can_receive_own_groups: e.target.checked })} /> Receive from assigned teams</label>
       </div>
-      <button className="btn primary" type="submit"><ShieldCheck size={16} />Create Role</button>
+      <button className="btn primary" type="submit"><ShieldCheck size={16} />Create Override</button>
     </form>
   );
 }
 
 function RolesTable({ roles, session, load, setStatus }) {
-  if (!roles.length) return <Empty title="No roles" detail="Create generic roles, then assign them to connection users." />;
+  if (!roles.length) return <Empty title="No overrides" detail="Create overrides only for users who need capabilities beyond normal team and level rules." />;
   const updateRole = async (role, patch) => {
     try {
       await api('/api/access-roles/update', session, { method: 'POST', body: JSON.stringify({ ...role, ...patch }) });
-      setStatus('Role updated.');
+      setStatus('Override updated.');
       await load();
     } catch (error) {
-      setStatus(`Role update failed: ${error.message}`);
+      setStatus(`Override update failed: ${error.message}`);
     }
   };
   return (
     <div className="table-wrap">
       <table className="access-table">
-        <thead><tr><th>Role</th><th>Permissions</th><th>Action</th></tr></thead>
+        <thead><tr><th>Override</th><th>Capabilities</th><th>Action</th></tr></thead>
         <tbody>
           {roles.map((role) => (
             <tr key={role.id}>
               <td><strong>{role.name}</strong><span>{role.description || '-'}</span></td>
               <td>
                 <div className="check-row compact">
-                  <label className="check"><input type="checkbox" checked={role.can_see_all} onChange={(e) => updateRole(role, { can_see_all: e.target.checked })} /> See everyone</label>
-                  <label className="check"><input type="checkbox" checked={role.can_send_all} onChange={(e) => updateRole(role, { can_send_all: e.target.checked })} /> Send everyone</label>
-                  <label className="check"><input type="checkbox" checked={role.can_receive_all} onChange={(e) => updateRole(role, { can_receive_all: e.target.checked })} /> Receive everyone</label>
-                  <label className="check"><input type="checkbox" checked={role.can_see_own_groups} onChange={(e) => updateRole(role, { can_see_own_groups: e.target.checked })} /> See assigned</label>
-                  <label className="check"><input type="checkbox" checked={role.can_send_own_groups} onChange={(e) => updateRole(role, { can_send_own_groups: e.target.checked })} /> Send assigned</label>
-                  <label className="check"><input type="checkbox" checked={role.can_receive_own_groups} onChange={(e) => updateRole(role, { can_receive_own_groups: e.target.checked })} /> Receive assigned</label>
+                  <label className="check"><input type="checkbox" checked={role.can_see_all} onChange={(e) => updateRole(role, { can_see_all: e.target.checked })} /> See all teams</label>
+                  <label className="check"><input type="checkbox" checked={role.can_send_all} onChange={(e) => updateRole(role, { can_send_all: e.target.checked })} /> Send all teams</label>
+                  <label className="check"><input type="checkbox" checked={role.can_receive_all} onChange={(e) => updateRole(role, { can_receive_all: e.target.checked })} /> Receive all teams</label>
+                  <label className="check"><input type="checkbox" checked={role.can_see_own_groups} onChange={(e) => updateRole(role, { can_see_own_groups: e.target.checked })} /> See assigned teams</label>
+                  <label className="check"><input type="checkbox" checked={role.can_send_own_groups} onChange={(e) => updateRole(role, { can_send_own_groups: e.target.checked })} /> Send assigned teams</label>
+                  <label className="check"><input type="checkbox" checked={role.can_receive_own_groups} onChange={(e) => updateRole(role, { can_receive_own_groups: e.target.checked })} /> Receive assigned teams</label>
                 </div>
               </td>
               <td>
@@ -1855,29 +1867,29 @@ function CreateGroup({ session, load, setStatus }) {
     event.preventDefault();
     try {
       await api('/api/access-groups/create', session, { method: 'POST', body: JSON.stringify(form) });
-      setStatus(`Group ${form.name} created.`);
+      setStatus(`Team ${form.name} created.`);
       setForm({ name: '', description: '', color: '#64c18c' });
       await load();
     } catch (error) {
-      setStatus(`Group create failed: ${error.message}`);
+      setStatus(`Team create failed: ${error.message}`);
     }
   };
   return (
     <form className="access-create group-create" onSubmit={submit}>
-      <label>Group name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Alpha" /></label>
+      <label>Team name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="Alpha" /></label>
       <label>Description<input value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} placeholder="Optional note" /></label>
       <label>Color<input type="color" value={form.color} onChange={(e) => setForm({ ...form, color: e.target.value })} /></label>
-      <button className="btn primary" type="submit"><Users size={16} />Create Group</button>
+      <button className="btn primary" type="submit"><Users size={16} />Create Team</button>
     </form>
   );
 }
 
 function GroupsTable({ groups, session, load, setStatus }) {
-  if (!groups.length) return <Empty title="No groups" detail="Create teams or access buckets, then link them together as needed." />;
+  if (!groups.length) return <Empty title="No teams" detail="Create teams first, then assign users and link teams together as needed." />;
   return (
     <div className="table-wrap">
       <table className="access-table">
-        <thead><tr><th>Group</th><th>Description</th><th>Action</th></tr></thead>
+        <thead><tr><th>Team</th><th>Description</th><th>Action</th></tr></thead>
         <tbody>
           {groups.map((group) => (
             <tr key={group.id}>
@@ -1898,7 +1910,7 @@ function GroupsTable({ groups, session, load, setStatus }) {
 }
 
 function BulkAccess({ users, roles, groups, session, load, setStatus }) {
-  const [form, setForm] = useState({ filter: '', role_id: '', access_level: '', level_mode: 'unchanged', group_ids: [], group_mode: 'replace', selected_user_ids: [] });
+  const [form, setForm] = useState({ filter: '', role_id: '', role_mode: 'unchanged', access_level: '1', level_mode: 'unchanged', group_ids: [], group_mode: 'replace', selected_user_ids: [] });
   const filter = form.filter.trim().toLowerCase();
   const matched = users.filter((user) => {
     if (!filter) return true;
@@ -1946,6 +1958,7 @@ function BulkAccess({ users, roles, groups, session, load, setStatus }) {
         body: JSON.stringify({
           user_ids: selectedUsers.map((user) => user.id),
           role_id: form.role_id || null,
+          role_mode: form.role_mode,
           access_level: form.access_level || null,
           level_mode: form.level_mode,
           group_ids: form.group_ids,
@@ -1961,21 +1974,28 @@ function BulkAccess({ users, roles, groups, session, load, setStatus }) {
   return (
     <form className="bulk-access" onSubmit={submit}>
       <div className="bulk-access-grid">
-        <label>Filter users<input value={form.filter} onChange={(e) => setForm({ ...form, filter: e.target.value })} placeholder="username, display name, role, or group" /></label>
-        <label>Role<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
-          <option value="">Leave role unchanged</option>
-          {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
+        <label>Filter users<input value={form.filter} onChange={(e) => setForm({ ...form, filter: e.target.value })} placeholder="username, display name, access type, or team" /></label>
+        <label>Access type action<select value={form.role_mode} onChange={(e) => setForm({ ...form, role_mode: e.target.value, role_id: e.target.value === 'set' ? form.role_id : '' })}>
+          <option value="unchanged">Leave access type unchanged</option>
+          <option value="clear">Set to Team User</option>
+          <option value="set">Set override</option>
         </select></label>
+        {form.role_mode === 'set' && (
+          <label>Override<select value={form.role_id} onChange={(e) => setForm({ ...form, role_id: e.target.value })}>
+            <option value="">Choose override</option>
+            {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
+          </select></label>
+        )}
         <label>Level action<select value={form.level_mode} onChange={(e) => setForm({ ...form, level_mode: e.target.value })}>
           <option value="unchanged">Leave level unchanged</option>
           <option value="set">Set level</option>
           <option value="clear">Clear level</option>
         </select></label>
         {form.level_mode === 'set' && <label>Level<AccessLevelSelect value={form.access_level} onChange={(value) => setForm({ ...form, access_level: value })} emptyLabel="Choose level" /></label>}
-        <label>Group action<select value={form.group_mode} onChange={(e) => setForm({ ...form, group_mode: e.target.value })}>
-          <option value="replace">Replace groups</option>
-          <option value="add">Add groups</option>
-          <option value="remove">Remove groups</option>
+        <label>Team action<select value={form.group_mode} onChange={(e) => setForm({ ...form, group_mode: e.target.value })}>
+          <option value="replace">Replace teams</option>
+          <option value="add">Add teams</option>
+          <option value="remove">Remove teams</option>
         </select></label>
         <button className="btn primary" type="submit"><ShieldCheck size={16} />Apply Policy to {selectedUsers.length}</button>
       </div>
@@ -1991,7 +2011,7 @@ function BulkAccess({ users, roles, groups, session, load, setStatus }) {
             <input type="checkbox" checked={form.group_ids.includes(group.id)} onChange={() => toggleGroup(group.id)} />
             <span className="color-dot" style={{ background: group.color || '#64c18c' }} /> {group.name}
           </label>
-        )) : <span className="hint">Create groups before bulk assigning users.</span>}
+        )) : <span className="hint">Create teams before bulk assigning users.</span>}
       </div>
       <div className="matched-users selected-users">
         {selectedUsers.slice(0, 12).map((user) => <Badge key={user.id}>{user.username}</Badge>)}
@@ -2013,9 +2033,9 @@ function UserSelectionList({ users, selectedIds, toggleUser }) {
             <small>{user.display_name || user.description || 'No description'}</small>
           </span>
           <span className="user-access-summary">
-            {user.role_name ? <Badge>{user.role_name}</Badge> : <Badge>no role</Badge>}
-            {user.access_level ? <Badge>Level {user.access_level}</Badge> : <Badge>no level</Badge>}
-            {(user.groups || []).length ? user.groups.map((group) => <Badge key={group.id}>{group.name}</Badge>) : <Badge>no groups</Badge>}
+            <Badge>{accessTypeName(user)}</Badge>
+            <Badge>{accessLevelName(user.access_level)}</Badge>
+            {(user.groups || []).length ? user.groups.map((group) => <Badge key={group.id}>{group.name}</Badge>) : <Badge>no teams</Badge>}
           </span>
         </label>
       ))}
@@ -2032,7 +2052,7 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
       user.id,
       {
         role_id: user.role_id || '',
-        access_level: user.access_level || '',
+        access_level: String(user.access_level || 1),
         group_ids: [...(user.group_ids || [])],
       },
     ])));
@@ -2054,14 +2074,14 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
     setDrafts((current) => ({
       ...current,
       [userId]: {
-        ...(current[userId] || { role_id: '', access_level: '', group_ids: [] }),
+        ...(current[userId] || { role_id: '', access_level: '1', group_ids: [] }),
         ...patch,
       },
     }));
   };
 
   const toggleDraftGroup = (userId, groupId) => {
-    const draft = drafts[userId] || { role_id: '', access_level: '', group_ids: [] };
+    const draft = drafts[userId] || { role_id: '', access_level: '1', group_ids: [] };
     const groupIds = new Set(draft.group_ids || []);
     if (groupIds.has(groupId)) groupIds.delete(groupId);
     else groupIds.add(groupId);
@@ -2087,7 +2107,7 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
     }
   };
 
-  if (!users.length) return <Empty title="No connection users" detail="Create users before assigning roles or groups." />;
+  if (!users.length) return <Empty title="No connection users" detail="Create users before assigning teams or access levels." />;
 
   return (
     <div className="individual-access">
@@ -2098,11 +2118,11 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
       <div className="table-wrap">
         <table className="access-table individual-access-table">
           <thead>
-            <tr><th>User</th><th>Role</th><th>Level</th><th>Groups</th><th>Action</th></tr>
+            <tr><th>User</th><th>Access Type</th><th>Level</th><th>Teams</th><th>Action</th></tr>
           </thead>
           <tbody>
             {filtered.map((user) => {
-              const draft = drafts[user.id] || { role_id: user.role_id || '', access_level: user.access_level || '', group_ids: user.group_ids || [] };
+              const draft = drafts[user.id] || { role_id: user.role_id || '', access_level: String(user.access_level || 1), group_ids: user.group_ids || [] };
               return (
                 <tr key={user.id}>
                   <td>
@@ -2111,7 +2131,7 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
                   </td>
                   <td>
                     <select value={draft.role_id || ''} onChange={(event) => updateDraft(user.id, { role_id: event.target.value })}>
-                      <option value="">No role</option>
+                      <option value="">Team User (default)</option>
                       {roles.map((role) => <option key={role.id} value={role.id}>{role.name}</option>)}
                     </select>
                   </td>
@@ -2125,7 +2145,7 @@ function UserAccessTable({ users, roles, groups, session, load, setStatus }) {
                           <input type="checkbox" checked={(draft.group_ids || []).includes(group.id)} onChange={() => toggleDraftGroup(user.id, group.id)} />
                           <span className="color-dot" style={{ background: group.color || '#64c18c' }} /> {group.name}
                         </label>
-                      )) : <span className="hint">No groups</span>}
+                      )) : <span className="hint">No teams</span>}
                     </div>
                   </td>
                   <td>
