@@ -55,6 +55,8 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn('log "Existing Docker Compose v2 detected; reusing it"', installer)
         self.assertIn('Deployment profiles:', installer)
         self.assertIn('profile="$(prompt_default "Deployment profile" "cloud")"', installer)
+        self.assertIn('DEPLOYMENT_PROFILE="${profile}"', installer)
+        self.assertIn('case "${DEPLOYMENT_PROFILE}" in', installer)
         self.assertIn('nat|router|proxmox)', installer)
         self.assertIn('local|lan|lab)', installer)
         self.assertIn('TAKLITE_ADMIN_LAN_BIND_IP=', installer)
@@ -92,7 +94,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("--release-zip", updater)
 
         service = (ROOT / "docker" / "taklite" / "taklite_service.py").read_text()
-        self.assertIn('VERSION = "TAKlite 0.2.25"', service)
+        self.assertIn('VERSION = "TAKlite 0.2.26"', service)
         self.assertIn('TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT", "true"', service)
         self.assertIn('TAKLITE_ALLOW_LEGACY_CLIENT_CERT", "false"', service)
         self.assertIn('TAKLITE_ACCESS_CONTROL_ENFORCE", "true"', service)

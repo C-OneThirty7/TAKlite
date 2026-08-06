@@ -1,6 +1,6 @@
 # TAKlite Access Control Guide
 
-Version: TAKlite v0.2.25
+Version: TAKlite v0.2.26
 
 ## Purpose
 

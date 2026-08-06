@@ -15,6 +15,7 @@ OS_CODENAME=""
 OS_PRETTY_NAME=""
 OS_ID_LIKE=""
 OS_ARCH=""
+DEPLOYMENT_PROFILE="cloud"
 
 log() {
   printf '[%s] %s\n' "${SCRIPT_NAME}" "$*"
@@ -276,7 +277,7 @@ validate_settings() {
 
 print_exposure_summary() {
   local upstream_note taklite_lan_line=""
-  case "${profile}" in
+  case "${DEPLOYMENT_PROFILE}" in
     cloud)
       upstream_note="Open ${WG_PORT}/udp to this server in the cloud firewall. Keep TAKlite, WGDashboard, CoT, and Marti ports closed publicly."
       ;;
@@ -301,7 +302,7 @@ Install exposure plan
 =====================
 
 Profile:
-  ${profile}
+  ${DEPLOYMENT_PROFILE}
 
 Upstream firewall/router:
   ${upstream_note}
@@ -456,6 +457,7 @@ EOF
       enable_lan_admin="no"
       ;;
   esac
+  DEPLOYMENT_PROFILE="${profile}"
 
   default_lan_cidr="$(ipv4_prefix24 "${detected_lan_ip}").0/24"
 
