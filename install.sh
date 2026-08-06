@@ -40,13 +40,17 @@ prompt_default() {
   printf '%s' "${value:-$default}"
 }
 
+lowercase() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
 prompt_yes_no() {
   local prompt="$1"
   local default="$2"
   local value normalized
   read -r -p "${prompt} [${default}]: " value
   normalized="${value:-$default}"
-  case "${normalized,,}" in
+  case "$(lowercase "${normalized}")" in
     y|yes|true|1) return 0 ;;
     *) return 1 ;;
   esac
@@ -243,18 +247,35 @@ validate_port_setting() {
   is_valid_port "${value}" || die "${label} must be a TCP/UDP port from 1 to 65535"
 }
 
+require_nonempty_setting() {
+  local label="$1"
+  local value="$2"
+  [[ -n "${value}" ]] || die "${label} cannot be empty"
+}
+
 validate_settings() {
   log "Validating install settings"
 
-  is_valid_endpoint "${SERVER_ENDPOINT}" || die "WireGuard endpoint must be a public IP, LAN IP, or DNS name clients can reach"
-  require_existing_interface "${SERVER_NIC}"
-  is_valid_interface_name "${WG_NIC}" || die "invalid WireGuard interface name: ${WG_NIC}"
-  is_valid_ipv4 "${WG_SERVER_IP}" || die "WireGuard server IPv4 must be a valid IPv4 address"
-  [[ "${WG_CIDR}" =~ ^[0-9]+$ ]] && (( WG_CIDR >= 1 && WG_CIDR <= 32 )) || die "WireGuard IPv4 CIDR must be from 1 to 32"
-  is_valid_ipv4 "${ADMIN_IP}" || die "Initial admin WireGuard IPv4 must be a valid IPv4 address"
-  is_valid_ipv4 "${WGD_BIND_IP}" || die "WGDashboard bind IP must be a valid IPv4 address"
-  is_valid_ipv4 "${TAKLITE_BIND_IP}" || die "TAKlite bind IP must be a valid IPv4 address"
-  is_valid_endpoint "${TAKLITE_PUBLIC_HOST}" || die "TAKlite API host must be an IP or DNS name clients can reach"
+  require_nonempty_setting "WireGuard endpoint" "${SERVER_ENDPOINT:-}"
+  require_nonempty_setting "Public network interface" "${SERVER_NIC:-}"
+  require_nonempty_setting "WireGuard interface name" "${WG_NIC:-}"
+  require_nonempty_setting "Initial admin peer name" "${ADMIN_NAME:-}"
+  require_nonempty_setting "Admin client AllowedIPs" "${ADMIN_ALLOWED_IPS:-}"
+  require_nonempty_setting "Client DNS resolver" "${CLIENT_DNS:-}"
+  require_nonempty_setting "WGDashboard username" "${WGD_USER:-}"
+  require_nonempty_setting "WGDashboard password" "${WGD_PASSWORD:-}"
+  require_nonempty_setting "TAKlite admin token" "${TAKLITE_ADMIN_TOKEN:-}"
+  require_nonempty_setting "ATAK/WinTAK certificate password" "${TAKLITE_CERT_PASSWORD:-}"
+
+  is_valid_endpoint "${SERVER_ENDPOINT:-}" || die "WireGuard endpoint must be a public IP, LAN IP, or DNS name clients can reach"
+  require_existing_interface "${SERVER_NIC:-}"
+  is_valid_interface_name "${WG_NIC:-}" || die "invalid WireGuard interface name: ${WG_NIC:-}"
+  is_valid_ipv4 "${WG_SERVER_IP:-}" || die "WireGuard server IPv4 must be a valid IPv4 address"
+  [[ "${WG_CIDR:-}" =~ ^[0-9]+$ ]] && (( WG_CIDR >= 1 && WG_CIDR <= 32 )) || die "WireGuard IPv4 CIDR must be from 1 to 32"
+  is_valid_ipv4 "${ADMIN_IP:-}" || die "Initial admin WireGuard IPv4 must be a valid IPv4 address"
+  is_valid_ipv4 "${WGD_BIND_IP:-}" || die "WGDashboard bind IP must be a valid IPv4 address"
+  is_valid_ipv4 "${TAKLITE_BIND_IP:-}" || die "TAKlite bind IP must be a valid IPv4 address"
+  is_valid_endpoint "${TAKLITE_PUBLIC_HOST:-}" || die "TAKlite API host must be an IP or DNS name clients can reach"
 
   if [[ -n "${LAN_ACCESS_CIDR:-}" ]]; then
     is_valid_cidr "${LAN_ACCESS_CIDR}" || die "LAN access CIDR must be a valid CIDR, for example 192.168.0.0/24"
@@ -264,15 +285,16 @@ validate_settings() {
     [[ -n "${LAN_ACCESS_CIDR:-}" ]] || die "LAN admin exposure requires a LAN access CIDR"
   fi
 
-  validate_port_setting "WireGuard UDP port" "${WG_PORT}"
-  validate_port_setting "WGDashboard port" "${WGD_PORT}"
-  validate_port_setting "TAKlite plain CoT TCP host port" "${TAKLITE_COT_HOST_PORT}"
-  validate_port_setting "TAKlite TLS CoT TCP host port" "${TAKLITE_COT_TLS_HOST_PORT}"
-  validate_port_setting "TAKlite HTTP/admin host port" "${TAKLITE_HTTP_HOST_PORT}"
-  validate_port_setting "TAKlite HTTPS/Marti host port" "${TAKLITE_HTTPS_HOST_PORT}"
+  validate_port_setting "WireGuard UDP port" "${WG_PORT:-}"
+  validate_port_setting "WGDashboard port" "${WGD_PORT:-}"
+  validate_port_setting "TAKlite plain CoT TCP host port" "${TAKLITE_COT_HOST_PORT:-}"
+  validate_port_setting "TAKlite TLS CoT TCP host port" "${TAKLITE_COT_TLS_HOST_PORT:-}"
+  validate_port_setting "TAKlite HTTP/admin host port" "${TAKLITE_HTTP_HOST_PORT:-}"
+  validate_port_setting "TAKlite HTTPS/Marti host port" "${TAKLITE_HTTPS_HOST_PORT:-}"
 
-  [[ -n "${TAKLITE_ADMIN_TOKEN}" ]] || die "TAKlite admin token cannot be empty"
-  [[ -n "${TAKLITE_CERT_PASSWORD}" ]] || die "ATAK/WinTAK certificate password cannot be empty"
+  require_nonempty_setting "Access enforcement setting" "${TAKLITE_ACCESS_CONTROL_ENFORCE:-}"
+  require_nonempty_setting "TLS client cert requirement setting" "${TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT:-}"
+  require_nonempty_setting "Legacy cert CN setting" "${TAKLITE_ALLOW_LEGACY_CLIENT_CERT:-}"
 }
 
 print_exposure_summary() {
@@ -414,7 +436,7 @@ Deployment profiles:
 EOF
 
   profile="$(prompt_default "Deployment profile" "cloud")"
-  profile="${profile,,}"
+  profile="$(lowercase "${profile}")"
   case "${profile}" in
     cloud|vps)
       profile="cloud"
@@ -494,7 +516,7 @@ EOF
   TAKLITE_ADMIN_TOKEN="$(prompt_default "TAKlite admin token" "$(random_token)")"
   TAKLITE_CERT_PASSWORD="$(prompt_default "ATAK/WinTAK certificate password" "atakatak")"
   TAKLITE_SECURE_MODE="$(prompt_default "Enable secure mode: require TLS cert identity and enforce groups" "yes")"
-  if [[ "${TAKLITE_SECURE_MODE,,}" =~ ^(y|yes|true|1)$ ]]; then
+  if [[ "$(lowercase "${TAKLITE_SECURE_MODE}")" =~ ^(y|yes|true|1)$ ]]; then
     TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT="true"
     TAKLITE_ALLOW_LEGACY_CLIENT_CERT="false"
     TAKLITE_ACCESS_CONTROL_ENFORCE="true"
@@ -1500,4 +1522,6 @@ main() {
   print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

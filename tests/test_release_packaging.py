@@ -1,4 +1,5 @@
 import pathlib
+import subprocess
 import unittest
 
 
@@ -94,7 +95,7 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("--release-zip", updater)
 
         service = (ROOT / "docker" / "taklite" / "taklite_service.py").read_text()
-        self.assertIn('VERSION = "TAKlite 0.2.26"', service)
+        self.assertIn('VERSION = "TAKlite 0.2.27"', service)
         self.assertIn('TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT", "true"', service)
         self.assertIn('TAKLITE_ALLOW_LEGACY_CLIENT_CERT", "false"', service)
         self.assertIn('TAKLITE_ACCESS_CONTROL_ENFORCE", "true"', service)
@@ -154,6 +155,52 @@ class ReleasePackagingTests(unittest.TestCase):
         self.assertIn("require_commands curl fail2ban-client git ip iptables python3 qrencode rsync wg wg-quick openssl zip docker", installer)
         self.assertNotIn("22|24|26", installer)
         self.assertNotIn("unsupported Ubuntu version", installer)
+
+    def test_installer_summary_path_is_safe_under_strict_mode(self):
+        script = f"""
+set -Eeuo pipefail
+source {str(ROOT / "install.sh")!r}
+require_existing_interface() {{ :; }}
+DEPLOYMENT_PROFILE=nat
+SERVER_ENDPOINT=203.0.113.10
+SERVER_NIC=lo
+WG_NIC=wg0
+WG_SERVER_IP=10.66.66.1
+WG_CIDR=24
+ADMIN_IP=10.66.66.2
+ADMIN_NAME=admin
+ADMIN_ALLOWED_IPS=0.0.0.0/0
+CLIENT_DNS=1.1.1.1
+WGD_BIND_IP=10.66.66.1
+WGD_PORT=10086
+WGD_USER=admin
+WGD_PASSWORD=test-password
+WG_PORT=51820
+TAKLITE_BIND_IP=10.66.66.1
+TAKLITE_PUBLIC_HOST=10.66.66.1
+LAN_ACCESS_CIDR=192.168.0.0/24
+TAKLITE_ADMIN_LAN_BIND_IP=192.168.0.225
+TAKLITE_COT_HOST_PORT=58087
+TAKLITE_COT_TLS_HOST_PORT=8089
+TAKLITE_HTTP_HOST_PORT=8080
+TAKLITE_HTTPS_HOST_PORT=8443
+TAKLITE_ADMIN_TOKEN=test-token
+TAKLITE_CERT_PASSWORD=atakatak
+TAKLITE_ACCESS_CONTROL_ENFORCE=true
+TAKLITE_COT_TLS_REQUIRE_CLIENT_CERT=true
+TAKLITE_ALLOW_LEGACY_CLIENT_CERT=false
+validate_settings
+print_exposure_summary >/tmp/taklite-installer-summary-test.txt
+grep -q "Profile:" /tmp/taklite-installer-summary-test.txt
+grep -q "nat" /tmp/taklite-installer-summary-test.txt
+"""
+        result = subprocess.run(["bash", "-c", script], cwd=ROOT, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+
+    def test_shell_entrypoints_are_syntax_valid(self):
+        for name in ("install.sh", "update.sh", "uninstall.sh", "reinstall.sh", "smoke-test.sh"):
+            result = subprocess.run(["bash", "-n", str(ROOT / name)], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
 
     def test_portable_desktop_assets_are_packaged(self):
         env_desktop = (ROOT / ".env.desktop.example").read_text()
